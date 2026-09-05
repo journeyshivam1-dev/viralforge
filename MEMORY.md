@@ -1,0 +1,21 @@
+- infra/docker/Dockerfile.api — API service Dockerfile
+- infra/docker/Dockerfile.worker — Worker Dockerfile with FFmpeg
+- infra/docker/Dockerfile.dashboard — Dashboard Dockerfile
+- infra/docker/docker-compose.yml — Complete Docker Compose config
+- packages/domain/src/adapters/omniroute-adapter.ts — Omniroute adapter with niche optimizations
+- packages/domain/src/schemas/content-item.ts — TypeScript interfaces for all content schemas
+- packages/domain/src/prompts/ — Niche prompt templates (seeded)
+- packages/supabase/migrations/001_initial_schema.sql — PostgreSQL migrations
+- services/api/src/routes/webhooks/telegram.ts — Telegram webhook handler
+- services/api/src/routes/webhooks/whatsapp.ts — WhatsApp webhook handler
+- services/api/src/routes/webhooks/omniroute.ts — Omniroute callback handler
+- services/api/src/queues/ — BullMQ queue system (connection, content, jobs)
+- services/workers/src/jobs/ — All 7 worker implementations
+- services/dashboard/src/pages/ — Next.js dashboard pages (calendar, accounts, jobs, analytics)
+- services/api/package.json — API service package
+- services/workers/package.json — Worker package
+- services/dashboard/package.json — Dashboard package
+- .gitignore — Git ignore file
+- package.json — Root monorepo config
+- .env.example — Environment template
+- README.md — Project documentation

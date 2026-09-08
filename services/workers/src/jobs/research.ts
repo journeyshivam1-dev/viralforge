@@ -6,9 +6,23 @@
 import { Job } from 'bullmq';
 import { supabase } from '@viralforge/supabase';
 import { validatePayload, NicheId } from '@viralforge/domain';
+import { queueTextGeneration } from '../queues/content-queue';
 
 export async function researchWorker(job: Job) {
-  const { contentItemId, nicheId, dataInputPayload } = job.data;
+  // Handle legacy jobs where contentItemId might be in triggerMetadata
+  const { contentItemId: topLevelContentItemId, nicheId: topLevelNicheId, dataInputPayload: topLevelDataInputPayload, triggerMetadata } = job.data;
+  const contentItemId = topLevelContentItemId || triggerMetadata?.contentItemId;
+  const nicheId = topLevelNicheId || triggerMetadata?.nicheId;
+  const dataInputPayload = topLevelDataInputPayload || triggerMetadata?.dataInputPayload || {};
+
+  if (!contentItemId) {
+    throw new Error('contentItemId is required in job.data or job.data.triggerMetadata');
+  }
+
+  // Log warning if we had to fall back to triggerMetadata
+  if (topLevelContentItemId !== contentItemId || topLevelNicheId !== nicheId) {
+    console.warn(`[Research] Using fallback values from triggerMetadata for content ${contentItemId}`);
+  }
 
   console.log(`[Research] Starting research for content ${contentItemId}`);
 
@@ -55,12 +69,33 @@ export async function researchWorker(job: Job) {
       throw new Error(`Failed to update content item: ${updateError.message}`);
     }
 
+    await job.updateProgress(75);
+
+    const generationJob = await queueTextGeneration({
+      contentItemId,
+      nicheId: nicheId as NicheId,
+      dataInputPayload: {
+        ...dataInputPayload,
+        ...enrichedData,
+      },
+      triggerSource: job.data.triggerSource || 'manual',
+      triggerMetadata: { researchJobId: String(job.id) },
+      idempotencyKey: `generation-${contentItemId}`,
+    });
+
     await job.updateProgress(90);
 
+    const { data: contentItem } = await supabase
+      .from('content_items')
+      .select('organization_id')
+      .eq('id', contentItemId)
+      .single();
+
     // Log audit event
-    await logAuditEvent(contentItemId, 'research.completed', {
+    await logAuditEvent(contentItem?.organization_id, contentItemId, 'research.completed', {
       nicheId,
       enrichedFields: Object.keys(enrichedData),
+      generationJobId: generationJob.id,
     });
 
     await job.updateProgress(100);
@@ -71,6 +106,7 @@ export async function researchWorker(job: Job) {
       success: true,
       contentItemId,
       enrichedData,
+      generationJob,
     };
   } catch (error) {
     console.error(`[Research] Error for content ${contentItemId}:`, error);
@@ -213,11 +249,13 @@ async function getCharacterSuggestions(theme: string) {
 }
 
 async function logAuditEvent(
+  organizationId: string | undefined,
   contentItemId: string,
   action: string,
   metadata: Record<string, any>
 ) {
   await supabase.from('audit_logs').insert({
+    organization_id: organizationId,
     content_item_id: contentItemId,
     action,
     actor: 'system',
@@ -225,5 +263,3 @@ async function logAuditEvent(
     metadata,
   });
 }
-
-export { researchWorker };

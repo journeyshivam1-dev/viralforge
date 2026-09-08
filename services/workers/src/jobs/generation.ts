@@ -11,7 +11,7 @@ import { NicheId } from '@viralforge/domain';
 
 // Initialize Omniroute adapter
 const omnirouteAdapter: OmnirouteAdapter = createOmnirouteAdapter(
-  process.env.OMNIROUTE_BASE_URL || 'http://localhost:3001',
+  process.env.OMNIROUTE_BASE_URL || 'http://localhost:20128',
   process.env.OMNIROUTE_API_KEY || '',
   process.env.OMNIROUTE_WEBHOOK_SECRET || '',
   parseInt(process.env.OMNIROUTE_TIMEOUT_MS || '300000')
@@ -315,5 +315,3 @@ async function logAuditEvent(
     metadata,
   });
 }
-
-export { generationWorker };

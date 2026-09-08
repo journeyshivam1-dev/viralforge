@@ -216,5 +216,3 @@ async function logAuditEvent(
     metadata,
   });
 }
-
-export { publishingWorker };

@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "commonjs",
+    "lib": ["ES2022"],
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "moduleResolution": "node",
+    "baseUrl": ".",
+    "paths": {
+      "@viralforge/domain": ["./packages/domain"],
+      "@viralforge/domain/*": ["./packages/domain/*"],
+      "@viralforge/supabase": ["./packages/supabase"],
+      "@viralforge/supabase/*": ["./packages/supabase/*"]
+    }
+  },
+  "exclude": ["node_modules", "**/dist", "**/build", "**/.next"]
+}

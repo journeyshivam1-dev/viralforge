@@ -3,26 +3,17 @@
  * Centralized Redis connection for all queues
  */
 
-import { Queue, Worker, ConnectionOptions } from 'bullmq';
+import { Queue, Worker } from 'bullmq';
 import Redis from 'ioredis';
 
-// Redis connection configuration
-const redisConfig: ConnectionOptions = {
-  host: process.env.REDIS_HOST || 'localhost',
-  port: parseInt(process.env.REDIS_PORT || '6379'),
-  password: process.env.REDIS_PASSWORD || undefined,
-  maxRetriesPerRequest: null, // Required for BullMQ
-};
+const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
 
 // Singleton connection for workers
 let connection: Redis | null = null;
 
 export function getRedisConnection(): Redis {
   if (!connection) {
-    connection = new Redis({
-      host: redisConfig.host,
-      port: redisConfig.port,
-      password: redisConfig.password,
+    connection = new Redis(redisUrl, {
       maxRetriesPerRequest: null,
     });
 

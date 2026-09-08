@@ -1,32 +1,35 @@
-/**
- * Package Index
- * Central package configuration for monorepo
- */
-
-const packageIndex = {
-  name: 'viralforge',
-  description: 'ViralForge - Hindi Regional Food Content Automation Platform',
-  version: '1.0.0',
-  private: false,
-  workspace: {
-    folders: [
-      'services/api',
-      'services/worker',
-      'services/dashboard',
-      'packages/domain',
-      'packages/supabase',
-      'packages/templates',
-      'packages/domain/src/prompts',
-      'packages/templates/music',
-      'packages/templates/fonts',
-      'packages/templates/branding/food',
-      'packages/templates/branding/health',
-      'packages/templates/branding/tech',
-      'packages/templates/branding/edtech',
-      'packages/templates/branding/travel',
-      'packages/templates/branding/cartoon'
-    ]
+{
+  "name": "viralforge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "ViralForge - Hindi Regional Food Content Automation Platform",
+  "workspaces": [
+    "services/api",
+    "services/workers",
+    "services/dashboard",
+    "packages/domain",
+    "packages/supabase"
+  ],
+  "scripts": {
+    "dev": "concurrently \"npm run dev:api\" \"npm run dev:workers\" \"npm run dev:dashboard\"",
+    "dev:api": "npm run dev --workspace=services/api",
+    "dev:workers": "npm run dev --workspace=services/workers",
+    "dev:dashboard": "npm run dev --workspace=services/dashboard",
+    "build": "npm run build --workspaces",
+    "start": "npm run start --workspaces",
+    "lint": "npm run lint --workspaces",
+    "test": "npm run test --workspaces",
+    "migrate": "npm run migrate --workspace=services/api",
+    "docker:up": "docker-compose up -d",
+    "docker:down": "docker-compose down",
+    "docker:logs": "docker-compose logs -f"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2",
+    "turbo": "^1.11.2"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "npm": ">=10.0.0"
   }
-};
-
-export default packageIndex;
+}

@@ -7,7 +7,7 @@ import { Job } from 'bullmq';
 import { supabase, storage } from '@viralforge/supabase';
 import { exec } from 'child_process';
 import { promisify } from 'util';
-import { promises as fs } from 'fs';
+import { promises as fs, existsSync } from 'fs';
 import path from 'path';
 
 const execAsync = promisify(exec);
@@ -107,7 +107,7 @@ export async function renderingWorker(job: Job) {
       outputPath,
       subtitlePath,
       musicPath,
-      logoPath: fs.existsSync(logoPath) ? logoPath : null,
+      logoPath: existsSync(logoPath) ? logoPath : null,
       contentItem,
     });
 
@@ -321,5 +321,3 @@ async function logAuditEvent(
     metadata,
   });
 }
-
-export { renderingWorker };

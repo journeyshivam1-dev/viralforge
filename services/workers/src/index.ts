@@ -3,8 +3,7 @@
  * BullMQ workers for parallel content processing
  */
 
-import { createWorker } from '../queues/connection';
-import { QUEUE_NAMES } from '../queues/connection';
+import { createWorker, QUEUE_NAMES } from './queues/connection';
 import { researchWorker } from './jobs/research';
 import { generationWorker } from './jobs/generation';
 import { mediaWorker } from './jobs/media';
@@ -12,6 +11,7 @@ import { renderingWorker } from './jobs/rendering';
 import { validationWorker } from './jobs/validation';
 import { publishingWorker } from './jobs/publishing';
 import { schedulerWorker } from './jobs/scheduler';
+
 
 const workers = [
   // Research worker - collects and validates input data
@@ -60,8 +60,8 @@ workers.forEach((worker) => {
     console.error(`Worker ${worker.name}: Job ${job?.id} failed:`, err.message);
   });
 
-  worker.on('stalled', (job) => {
-    console.warn(`Worker ${worker.name}: Job ${job?.id} stalled`);
+  worker.on('stalled', (jobId) => {
+    console.warn(`Worker ${worker.name}: Job ${jobId} stalled`);
   });
 
   worker.on('progress', (job, progress) => {

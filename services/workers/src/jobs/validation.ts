@@ -302,5 +302,3 @@ async function logAuditEvent(
     metadata,
   });
 }
-
-export { validationWorker };

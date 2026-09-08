@@ -8,7 +8,7 @@ import { supabase, storage } from '@viralforge/supabase';
 import { createOmnirouteAdapter, NicheId } from '@viralforge/domain';
 
 const omnirouteAdapter = createOmnirouteAdapter(
-  process.env.OMNIROUTE_BASE_URL || 'http://localhost:3001',
+  process.env.OMNIROUTE_BASE_URL || 'http://localhost:20128',
   process.env.OMNIROUTE_API_KEY || '',
   process.env.OMNIROUTE_WEBHOOK_SECRET || '',
   parseInt(process.env.OMNIROUTE_TIMEOUT_MS || '300000')
@@ -38,22 +38,62 @@ export async function mediaWorker(job: Job) {
     // Determine media type and generate
     let mediaUrl: string;
     let mediaType: string;
+    let autoGenerationFailed = false;
 
     if (contentItem.media_type === 'video_reel') {
       // Generate video
       const result = await generateVideo(contentItem, nicheId as NicheId);
-      mediaUrl = result.url;
-      mediaType = 'video/mp4';
+      if (result.status === 'failed' || !result.url) {
+        autoGenerationFailed = true;
+        console.warn(`[Media] Video generation failed for ${contentItemId}, skipping media step (user upload required)`);
+      } else {
+        mediaUrl = result.url;
+        mediaType = 'video/mp4';
+      }
     } else if (contentItem.media_type === 'image_carousel') {
       // Generate carousel of images
       const result = await generateCarousel(contentItem, nicheId as NicheId);
-      mediaUrl = result.url;
-      mediaType = 'image/jpeg';
+      if (result.status === 'failed' || !result.url) {
+        autoGenerationFailed = true;
+        console.warn(`[Media] Carousel generation failed for ${contentItemId}, skipping media step (user upload required)`);
+      } else {
+        mediaUrl = result.url;
+        mediaType = 'image/jpeg';
+      }
     } else {
       // Single image
       const result = await generateSingleImage(contentItem, nicheId as NicheId);
-      mediaUrl = result.url;
-      mediaType = 'image/jpeg';
+      if (result.status === 'failed' || !result.url) {
+        autoGenerationFailed = true;
+        console.warn(`[Media] Image generation failed for ${contentItemId}, skipping media step (user upload required)`);
+      } else {
+        mediaUrl = result.url;
+        mediaType = 'image/jpeg';
+      }
+    }
+
+    if (autoGenerationFailed) {
+      // Update content item with warning and advance to validated so the user can upload their own media
+      const { error: warnError } = await supabase
+        .from('content_items')
+        .update({
+          status: 'validated',
+          validation_warnings: [
+            'Media generation is currently unavailable. Please upload your own media before scheduling.',
+          ],
+        })
+        .eq('id', contentItemId);
+
+      if (warnError) {
+        throw new Error(`Failed to update content item: ${warnError.message}`);
+      }
+
+      return {
+        success: true,
+        contentItemId,
+        mediaGenerationUnavailable: true,
+        message: 'Media generation unavailable; user upload required to proceed to publishing',
+      };
     }
 
     await job.updateProgress(70);
@@ -128,7 +168,7 @@ export async function mediaWorker(job: Job) {
 /**
  * Generate video using Omniroute
  */
-async function generateVideo(contentItem: any, nicheId: NicheId): Promise<{ url: string }> {
+async function generateVideo(contentItem: any, nicheId: NicheId): Promise<{ status: 'completed' | 'failed'; url?: string; error?: string }> {
   const prompt = buildVideoPrompt(contentItem, nicheId);
 
   const response = await omnirouteAdapter.generateContent({
@@ -143,17 +183,17 @@ async function generateVideo(contentItem: any, nicheId: NicheId): Promise<{ url:
     callbackUrl: process.env.API_URL ? `${process.env.API_URL}/webhooks/omniroute` : undefined,
   });
 
-  if (response.status === 'failed') {
-    throw new Error(`Video generation failed: ${response.error}`);
+  if (response.status === 'failed' || !response.result?.videoUrl) {
+    return { status: 'failed', url: '', error: response.error || 'Video generation returned no URL' };
   }
 
-  return { url: response.result?.videoUrl || '' };
+  return { status: 'completed', url: response.result.videoUrl };
 }
 
 /**
  * Generate carousel of images
  */
-async function generateCarousel(contentItem: any, nicheId: NicheId): Promise<{ url: string }> {
+async function generateCarousel(contentItem: any, nicheId: NicheId): Promise<{ status: 'completed' | 'failed'; url?: string; error?: string }> {
   // Generate 5-7 images for the carousel
   const imagePrompts = buildImagePrompts(contentItem, nicheId, 5);
   const imageUrls: string[] = [];
@@ -174,14 +214,18 @@ async function generateCarousel(contentItem: any, nicheId: NicheId): Promise<{ u
     }
   }
 
+  if (imageUrls.length === 0) {
+    return { status: 'failed', error: 'No images were generated for the carousel' };
+  }
+
   // For carousel, return the first image URL (others are stored separately)
-  return { url: imageUrls[0] || '' };
+  return { status: 'completed', url: imageUrls[0] };
 }
 
 /**
  * Generate single image
  */
-async function generateSingleImage(contentItem: any, nicheId: NicheId): Promise<{ url: string }> {
+async function generateSingleImage(contentItem: any, nicheId: NicheId): Promise<{ status: 'completed' | 'failed'; url?: string; error?: string }> {
   const prompt = buildImagePrompts(contentItem, nicheId, 1)[0];
 
   const response = await omnirouteAdapter.generateContent({
@@ -194,7 +238,11 @@ async function generateSingleImage(contentItem: any, nicheId: NicheId): Promise<
     },
   });
 
-  return { url: response.result?.imageUrl || '' };
+  if (response.status === 'failed' || !response.result?.imageUrl) {
+    return { status: 'failed', error: response.error || 'Image generation returned no URL' };
+  }
+
+  return { status: 'completed', url: response.result.imageUrl };
 }
 
 /**
@@ -271,4 +319,3 @@ async function logAuditEvent(
   });
 }
 
-export { mediaWorker };

@@ -129,6 +129,24 @@ export async function retryJob(queueName: string, jobId: string): Promise<boolea
 }
 
 /**
+ * Discard (remove) a job from the queue
+ */
+export async function discardJob(queueName: string, jobId: string): Promise<boolean> {
+  const queue = getQueue(queueName);
+
+  try {
+    const job = await queue.getJob(jobId);
+    if (!job) return false;
+
+    await job.remove();
+    return true;
+  } catch (error) {
+    console.error(`Failed to discard job ${jobId}:`, error);
+    return false;
+  }
+}
+
+/**
  * Get failed jobs count
  */
 export async function getFailedJobsCount(queueName: string): Promise<number> {
@@ -159,6 +177,7 @@ export default {
   failJob,
   getQueueJobStatus,
   retryJob,
+  discardJob,
   getFailedJobsCount,
   getWaitingJobsCount,
   getActiveJobs,

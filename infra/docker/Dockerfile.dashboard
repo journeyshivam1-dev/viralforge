@@ -2,41 +2,42 @@ FROM node:20-alpine AS builder
 
 WORKDIR /app
 
-# Copy package files
-COPY services/dashboard/package*.json ./
-COPY package.json ./
+COPY package.json package-lock.json ./
+COPY services/dashboard/package.json ./services/dashboard/package.json
+COPY services/api/package.json ./services/api/package.json
+COPY services/workers/package.json ./services/workers/package.json
+COPY packages/domain/package.json ./packages/domain/package.json
+COPY packages/supabase/package.json ./packages/supabase/package.json
 
-# Install dependencies
 RUN npm ci
 
-# Copy source
 COPY services/dashboard/ ./services/dashboard/
 COPY packages/ ./packages/
 
-# Build Next.js app
-RUN npm run build
+ARG API_URL=http://api:3000
+ENV API_URL=$API_URL
+ENV NODE_ENV=production
+
+RUN npm run build --workspace=services/dashboard
 
 FROM node:20-alpine AS runner
 
 WORKDIR /app
-
 ENV NODE_ENV=production
+ENV API_URL=http://api:3000
 
-# Install dependencies
+COPY --from=builder /app/package.json /app/package-lock.json ./
+COPY --from=builder /app/node_modules/ ./node_modules/
 COPY --from=builder /app/services/dashboard/ ./services/dashboard/
 COPY --from=builder /app/packages/ ./packages/
-COPY --from=builder /app/node_modules/ ./node_modules/
-COPY --from=builder /app/package.json ./package.json
-COPY --from=builder /app/services/dashboard/.next/ ./services/dashboard/.next/
 
-# Create non-root user
-RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup \
+  && chown -R appuser:appgroup /app
 
 USER appuser
-
 EXPOSE 3001
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-  CMD wget --no-verbose --tries=1 --spider http://localhost:3001/health || exit 1
+  CMD wget --no-verbose --tries=1 --spider http://localhost:3001/ || exit 1
 
-CMD ["node", "services/dashboard/dist/main.js"]
+CMD ["npm", "run", "start", "--workspace=services/dashboard"]

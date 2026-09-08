@@ -6,6 +6,8 @@
     "dev": "next dev -p 3001",
     "build": "next build",
     "start": "next start -p 3001",
+    "clean": "node -e \"for (const path of ['.next','.next-dev']) require('fs').rmSync(path,{recursive:true,force:true})\"",
+    "clean:dev": "node -e \"require('fs').rmSync('.next-dev',{recursive:true,force:true})\"",
     "lint": "next lint",
     "test": "jest"
   },

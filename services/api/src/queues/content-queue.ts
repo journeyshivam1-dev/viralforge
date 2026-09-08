@@ -1,6 +1,6 @@
 /**
- * Content Queue - Job Enqueueing Functions
- * High-level API for queuing content generation jobs
+ * Content queue entry points. Every job carries the canonical content item ID,
+ * so workers never create detached pipeline records.
  */
 
 import { getQueue, QUEUE_NAMES } from './connection';
@@ -8,11 +8,12 @@ import { v4 as uuidv4 } from 'uuid';
 import { NicheId, TriggerSource } from '@viralforge/domain';
 
 interface ContentJobData {
+  contentItemId?: string;
   nicheId: NicheId;
   subTopic: string;
-  dataInputPayload?: Record<string, any>;
+  dataInputPayload?: Record<string, unknown>;
   triggerSource: TriggerSource;
-  triggerMetadata?: Record<string, any>;
+  triggerMetadata?: Record<string, unknown>;
   scheduledAt?: Date;
   idempotencyKey?: string;
 }
@@ -23,157 +24,89 @@ interface JobResult {
   queue: string;
 }
 
-/**
- * Queue content generation job
- * This is the main entry point for content creation
- */
-export async function queueContentGeneration(data: ContentJobData): Promise<JobResult> {
-  const queue = getQueue(QUEUE_NAMES.RESEARCH);
-
-  const jobId = uuidv4();
-  const idempotencyKey = data.idempotencyKey || `${data.triggerSource}-${data.nicheId}-${data.subTopic}-${Date.now()}`;
-
-  const job = await queue.add(
-    'research',
-    {
-      jobId,
-      ...data,
-      idempotencyKey,
-    },
-    {
-      jobId,
-      // Delay based on trigger source
-      delay: calculateDelay(data),
-    }
-  );
-
-  return {
-    id: job.id!,
-    contentItemId: jobId,
-    queue: QUEUE_NAMES.RESEARCH,
-  };
-}
-
-/**
- * Queue rendering job (called after generation completes)
- */
-export async function queueRendering(contentItemId: string): Promise<JobResult> {
-  const queue = getQueue(QUEUE_NAMES.RENDERING);
-
-  const job = await queue.add(
-    'render',
-    {
-      contentItemId,
-      jobId: uuidv4(),
-    },
-    {
-      attempts: 2,
-      priority: 1,
-    }
-  );
-
-  return {
-    id: job.id!,
-    contentItemId,
-    queue: QUEUE_NAMES.RENDERING,
-  };
-}
-
-/**
- * Queue validation job
- */
-export async function queueValidation(contentItemId: string): Promise<JobResult> {
-  const queue = getQueue(QUEUE_NAMES.VALIDATION);
-
-  const job = await queue.add(
-    'validate',
-    {
-      contentItemId,
-      jobId: uuidv4(),
-    },
-    {
-      priority: 2, // Run after rendering
-    }
-  );
-
-  return {
-    id: job.id!,
-    contentItemId,
-    queue: QUEUE_NAMES.VALIDATION,
-  };
-}
-
-/**
- * Queue publishing job
- */
-export async function queuePublishing(
-  contentItemId: string,
-  scheduledAt?: Date
+async function addContentJob(
+  queueName: string,
+  name: string,
+  data: Record<string, unknown>,
+  options: Record<string, unknown> = {},
 ): Promise<JobResult> {
-  const queue = getQueue(QUEUE_NAMES.PUBLISHING);
+  const jobId = uuidv4();
+  const contentItemId = String(data.contentItemId);
+  const job = await getQueue(queueName).add(name, { ...data, jobId }, {
+    jobId,
+    ...options,
+  });
 
-  const delay = scheduledAt
-    ? scheduledAt.getTime() - Date.now()
-    : 0;
+  return { id: job.id!, contentItemId, queue: queueName };
+}
 
-  const job = await queue.add(
-    'publish',
-    {
-      contentItemId,
-      jobId: uuidv4(),
-    },
-    {
-      delay: Math.max(0, delay),
-      // Only attempt once for publishing (no retries after final post)
-      attempts: 1,
-    }
-  );
-
-  return {
-    id: job.id!,
+export async function queueContentGeneration(data: ContentJobData): Promise<JobResult> {
+  const contentItemId = data.contentItemId || uuidv4();
+  return addContentJob(QUEUE_NAMES.RESEARCH, 'research', {
+    ...data,
     contentItemId,
-    queue: QUEUE_NAMES.PUBLISHING,
-  };
+    idempotencyKey: data.idempotencyKey || `research-${contentItemId}`,
+  }, { delay: calculateDelay(data) });
 }
 
-/**
- * Queue scheduled items for the next interval
- * Called by the scheduler cron job
- */
-export async function queueScheduledItems(): Promise<number> {
-  // This would query the database for items scheduled within the next interval
-  // For now, return 0 - implemented in the scheduler service
-  return 0;
+export async function queueTextGeneration(
+  contentItemId: string,
+  nicheId: NicheId,
+  dataInputPayload: Record<string, unknown> = {},
+  triggerSource: TriggerSource = 'manual',
+): Promise<JobResult> {
+  return addContentJob(QUEUE_NAMES.GENERATION, 'generate-text', {
+    contentItemId,
+    nicheId,
+    dataInputPayload,
+    triggerSource,
+    idempotencyKey: `generation-${contentItemId}`,
+  });
 }
 
-/**
- * Calculate job delay based on trigger source and time
- */
+export async function queueMediaGeneration(
+  contentItemId: string,
+  nicheId: NicheId,
+): Promise<JobResult> {
+  return addContentJob(QUEUE_NAMES.MEDIA, 'generate-media', {
+    contentItemId,
+    nicheId,
+    idempotencyKey: `media-${contentItemId}`,
+  });
+}
+
+export async function queueRendering(contentItemId: string): Promise<JobResult> {
+  return addContentJob(QUEUE_NAMES.RENDERING, 'render', {
+    contentItemId,
+    idempotencyKey: `render-${contentItemId}`,
+  }, { attempts: 2, priority: 1 });
+}
+
+export async function queueValidation(contentItemId: string): Promise<JobResult> {
+  return addContentJob(QUEUE_NAMES.VALIDATION, 'validate', {
+    contentItemId,
+    idempotencyKey: `validate-${contentItemId}`,
+  }, { priority: 2 });
+}
+
+export async function queuePublishing(contentItemId: string, scheduledAt?: Date): Promise<JobResult> {
+  const delay = scheduledAt ? Math.max(0, scheduledAt.getTime() - Date.now()) : 0;
+  return addContentJob(QUEUE_NAMES.PUBLISHING, 'publish', {
+    contentItemId,
+    idempotencyKey: `publish-${contentItemId}`,
+  }, { delay, attempts: 1 });
+}
+
 function calculateDelay(data: ContentJobData): number {
-  // Telegram/WhatsApp triggers process immediately
-  if (data.triggerSource === 'telegram' || data.triggerSource === 'whatsapp') {
-    return 0;
-  }
-
-  // Manual triggers process immediately
-  if (data.triggerSource === 'manual') {
-    return 0;
-  }
-
-  // Calendar triggers respect scheduled time
-  if (data.scheduledAt) {
-    const delay = data.scheduledAt.getTime() - Date.now();
-    return Math.max(0, delay);
-  }
-
-  // Default: process immediately
-  return 0;
+  if (data.triggerSource !== 'calendar' || !data.scheduledAt) return 0;
+  return Math.max(0, data.scheduledAt.getTime() - Date.now());
 }
 
 export default {
   queueContentGeneration,
+  queueTextGeneration,
+  queueMediaGeneration,
   queueRendering,
   queueValidation,
   queuePublishing,
-  queueScheduledItems,
 };

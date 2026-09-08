@@ -108,10 +108,14 @@ router.post('/omniroute', async (req: Request, res: Response) => {
         await failJob(job.id, payload.error || 'Unknown error');
 
         // Update content item status
-        const { updateContentItemStatus } = await import('../../services/content-service');
-        await updateContentItemStatus(job.contentItemId, 'failed', {
-          error: payload.error
-        });
+        const { supabase } = await import('@viralforge/supabase');
+        await supabase
+          .from('content_items')
+          .update({
+            status: 'failed',
+            validation_errors: [payload.error || 'Omniroute job failed'],
+          })
+          .eq('id', job.contentItemId);
         break;
 
       case 'processing':

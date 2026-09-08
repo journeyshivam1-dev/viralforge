@@ -1,0 +1,13 @@
+{
+  "/_app": "pages/_app.js",
+  "/_error": "pages/_error.js",
+  "/_document": "pages/_document.js",
+  "/": "pages/index.js",
+  "/content/new": "pages/content/new.js",
+  "/calendar": "pages/calendar.js",
+  "/queues": "pages/queues.js",
+  "/niches": "pages/niches.js",
+  "/accounts": "pages/accounts.js",
+  "/audit": "pages/audit.js",
+  "/settings": "pages/settings.js"
+}

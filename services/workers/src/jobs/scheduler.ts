@@ -5,7 +5,10 @@
 
 import { Job } from 'bullmq';
 import { supabase } from '@viralforge/supabase';
-import { queueContentGeneration, queuePublishing } from '../../api/src/queues/content-queue';
+import {
+  queueContentGeneration,
+  queuePublishing,
+} from '../queues/content-queue';
 
 const SCHEDULE_WINDOW_MINUTES = 5; // Check 5 minutes ahead
 
@@ -104,4 +107,3 @@ export async function schedulerWorker(job: Job) {
   }
 }
 
-export { schedulerWorker };

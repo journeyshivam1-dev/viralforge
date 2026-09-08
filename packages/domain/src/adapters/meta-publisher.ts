@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Meta Publisher Adapters
  * Instagram and Facebook Graph API publishers using official endpoints
  */
@@ -75,7 +75,7 @@ export class InstagramPublisher {
         throw new Error(`Failed to create IG container: ${JSON.stringify(error)}`);
       }
 
-      const containerData = await containerResponse.json();
+      const containerData = await containerResponse.json() as { id: string };
       const creationId = containerData.id;
 
       // Step 2: Poll until container is ready (max 60 seconds)
@@ -99,7 +99,7 @@ export class InstagramPublisher {
         throw new Error(`Failed to publish IG media: ${JSON.stringify(error)}`);
       }
 
-      const publishData = await publishResponse.json();
+      const publishData = await publishResponse.json() as { id: string };
       const mediaId = publishData.id;
 
       // Get permalink
@@ -132,7 +132,7 @@ export class InstagramPublisher {
         throw new Error('Failed to check container status');
       }
 
-      const data = await response.json();
+      const data = await response.json() as any;
 
       if (data.status_code === 'FINISHED') {
         return;
@@ -157,7 +157,7 @@ export class InstagramPublisher {
       const response = await fetch(
         `${this.baseUrl}/${mediaId}?fields=permalink&access_token=${this.accessToken}`
       );
-      const data = await response.json();
+      const data = await response.json() as any;
       return data.permalink;
     } catch {
       return undefined;
@@ -169,7 +169,7 @@ export class InstagramPublisher {
    */
   private buildCaption(caption: string, aiRequired: boolean): string {
     if (aiRequired) {
-      return `${caption}\n\n🤖 AI-generated content`;
+      return `${caption}\n\nðŸ¤– AI-generated content`;
     }
     return caption;
   }
@@ -187,7 +187,7 @@ export class InstagramPublisher {
         throw new Error('Failed to fetch insights');
       }
 
-      return await response.json();
+      return await response.json() as { accessToken: string; expiresIn: number };
     } catch (error) {
       console.error('Failed to get insights:', error);
       return null;
@@ -235,7 +235,7 @@ export class FacebookPublisher {
         throw new Error(`Failed to start FB upload: ${JSON.stringify(error)}`);
       }
 
-      const uploadSession = await uploadResponse.json();
+      const uploadSession = await uploadResponse.json() as { video_id: string; upload_session_id: string };
       const videoId = uploadSession.video_id;
 
       // Upload the video file
@@ -286,7 +286,7 @@ export class FacebookPublisher {
         throw new Error(`Failed to publish FB Reel: ${JSON.stringify(error)}`);
       }
 
-      const publishData = await publishResponse.json();
+      const publishData = await publishResponse.json() as { id: string };
       const postId = publishData.id;
 
       // Get permalink
@@ -318,7 +318,7 @@ export class FacebookPublisher {
         throw new Error('Failed to check video status');
       }
 
-      const data = await response.json();
+      const data = await response.json() as any;
 
       if (data.status?.video_status === 'ready') {
         return;
@@ -342,7 +342,7 @@ export class FacebookPublisher {
       const response = await fetch(
         `${this.baseUrl}/${postId}?fields=permalink_url&access_token=${this.accessToken}`
       );
-      const data = await response.json();
+      const data = await response.json() as any;
       return data.permalink_url;
     } catch {
       return undefined;
@@ -411,7 +411,7 @@ export class MetaOAuth {
       throw new Error('Failed to exchange code for token');
     }
 
-    return await response.json();
+    return await response.json() as { accessToken: string; expiresIn: number };
   }
 
   /**
@@ -436,7 +436,7 @@ export class MetaOAuth {
       throw new Error('Failed to get long-lived token');
     }
 
-    return await response.json();
+    return await response.json() as { accessToken: string; expiresIn: number };
   }
 
   /**
@@ -451,7 +451,7 @@ export class MetaOAuth {
       throw new Error('Failed to fetch user pages');
     }
 
-    const data = await response.json();
+    const data = await response.json() as any;
     return data.data || [];
   }
 
@@ -467,7 +467,7 @@ export class MetaOAuth {
       return null;
     }
 
-    const data = await response.json();
+    const data = await response.json() as any;
     return data.instagram_business_account;
   }
 }

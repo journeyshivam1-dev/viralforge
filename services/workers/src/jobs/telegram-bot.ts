@@ -134,10 +134,27 @@ async function handleCallback(token: string, query: NonNullable<TelegramUpdate['
     return answer('Not authorised');
   }
   const [action, runId] = (query.data || '').split(':');
-  if (!['approve', 'reject'].includes(action) || !UUID.test(runId || '')) return answer('Unknown action');
+  if (!['approve', 'reject', 'slots_apply', 'slots_dismiss'].includes(action) || !UUID.test(runId || '')) return answer('Unknown action');
 
   const admin = requireSupabaseAdmin();
   const actor = `telegram:${query.from.id}`;
+  if (action === 'slots_apply' || action === 'slots_dismiss') {
+    const { data: outcome, error: slotError } = action === 'slots_apply'
+      ? await admin.rpc('apply_slot_recommendation', { p_id: runId, p_decided_by: actor })
+      : await admin.rpc('dismiss_slot_recommendation', { p_id: runId, p_decided_by: actor });
+    if (slotError) return answer(`Could not update: ${slotError.message}`);
+    if (action === 'slots_apply' && !outcome?.applied) return answer(String(outcome?.reason || 'Not applied'));
+    await answer(action === 'slots_apply' ? 'Applied from the next planned day' : 'Dismissed');
+    if (query.message) {
+      await callTelegram(token, 'editMessageReplyMarkup', {
+        chat_id: query.message.chat.id,
+        message_id: query.message.message_id,
+        reply_markup: { inline_keyboard: [] },
+      }).catch(() => undefined);
+      await reply(token, query.message.chat.id, action === 'slots_apply' ? '✅ New slots applied' : '✖ Kept current slots');
+    }
+    return;
+  }
   const { error } = action === 'approve'
     ? await admin.rpc('approve_pipeline_run', { p_run_id: runId, p_approved_by: actor })
     : await admin.rpc('reject_pipeline_run', { p_run_id: runId, p_rejected_by: actor, p_reason: 'Rejected from Telegram' });

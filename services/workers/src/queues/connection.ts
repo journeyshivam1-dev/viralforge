@@ -35,6 +35,7 @@ export const QUEUE_NAMES = {
   NOTIFICATIONS: 'viralforge-notifications',
   PLANNER: 'viralforge-planner',
   TELEGRAM: 'viralforge-telegram',
+  ANALYTICS: 'viralforge-analytics',
 } as const;
 
 const queues = new Map<string, Queue>();

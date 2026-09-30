@@ -9,6 +9,25 @@ This file is the source of truth for what exists, what Phase 1 shipped, what is 
 
 ---
 
+## Phase 3 status (2026-10-01) — read this first
+
+Plan: `docs/PHASE3_PLAN.md`. Closes the loop: measure posts, move posting times toward what works, alert on ops problems.
+
+| Slice | What | Where |
+|---|---|---|
+| S1 | `post_insights` at 1h/24h/72h/7d per publication (counts only, no viewer data); collector every 15 min, 25/tick, 3 retries; IG metric fallback when Meta rejects one; FB counts from object fields | migration `20261001000100_*`, `jobs/insights.ts`, `MetaGraphClient.getInstagramInsights/getFacebookInsights` |
+| S2 | Slot tuning: `slot_tuning` off/suggest(default)/auto + `exploration_minutes` (default 30: one slot/day shifted ±30). Weekly Mon 03:00 IST, platform+media normalised, Bayesian-shrunk, ≥4 samples both sides, ≥10% lift, 90-min gap, max 2 moves. Stale recommendations are superseded, never applied | `packages/domain/src/insights.ts` (`recommendSlots`), `planner.ts` (`explorationShift`), `jobs/slot-tuning.ts` |
+| S3 | Alerts: planner failure (once per niche/day), account health 08:00 IST (revoked → `expired`), daily digest 22:30 IST; Telegram Apply/Dismiss for slot recommendations | `jobs/operations.ts`, `jobs/notifications.ts`, `jobs/telegram-bot.ts` |
+| S4 | API `/insights/summary`, `/slot-recommendations(/:id/apply|dismiss)`, `/slot-tuning/run`; dashboard **Insights** page; tuning fields on Automation | `services/api/src/routes/insights.ts`, `services/dashboard/src/pages/insights.tsx` |
+
+**Checks:** unit 50/50 · pgTAP 53/53 · db lint (2 known warnings) · builds + dashboard typecheck. Smoke-tested locally with
+synthetic insights (removed afterwards): tuning proposed 21:30 → 21:00, Apply via API changed the slots, a second Apply was refused.
+Nothing here posts anything; insights only start once real publishing is on.
+
+**Not done:** real Graph insight calls are unverified until accounts are connected and publishing is enabled — metric names
+are the risky part (fallback set exists). The API still has no user auth (single local operator); multi-user needs the
+central OAuth2/JWT server.
+
 ## Phase 2 status (2026-09-30) — read this first
 
 Plan and operator decisions: `docs/PHASE2_PLAN.md`. Meta/WhatsApp/tunnel setup: `docs/META_SETUP.md`.

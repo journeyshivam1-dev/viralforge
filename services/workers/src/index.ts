@@ -16,6 +16,9 @@ import { outboxDispatcherWorker, reconciliationWorker } from './jobs/outbox-disp
 import { notificationWorker } from './jobs/notifications';
 import { plannerWorker } from './jobs/planner';
 import { telegramPollWorker, telegramUpdateWorker } from './jobs/telegram-bot';
+import { insightsCollectorWorker } from './jobs/insights';
+import { slotTuningWorker } from './jobs/slot-tuning';
+import { accountHealthWorker, dailyDigestWorker } from './jobs/operations';
 import { withPipelineRuntime } from './pipeline/runtime';
 
 const workers = [
@@ -70,6 +73,17 @@ const workers = [
 
   // Operator alerts (Telegram / WhatsApp) from notification_outbox.
   createWorker(QUEUE_NAMES.NOTIFICATIONS, notificationWorker, { concurrency: 1 }),
+
+  // Post insights, weekly slot tuning, account health and the daily digest.
+  createWorker(QUEUE_NAMES.ANALYTICS, async (job: Job) => {
+    switch (job.name) {
+      case 'collect-insights': return insightsCollectorWorker(job);
+      case 'tune-slots': return slotTuningWorker(job);
+      case 'account-health': return accountHealthWorker(job);
+      case 'daily-digest': return dailyDigestWorker(job);
+      default: throw new Error(`Unknown analytics job ${job.name}`);
+    }
+  }, { concurrency: 1, lockDuration: 5 * 60_000 }),
 ];
 
 async function ensureMaintenanceJobs() {
@@ -79,6 +93,7 @@ async function ensureMaintenanceJobs() {
   const notifications = getQueue(QUEUE_NAMES.NOTIFICATIONS);
   const planner = getQueue(QUEUE_NAMES.PLANNER);
   const telegram = getQueue(QUEUE_NAMES.TELEGRAM);
+  const analytics = getQueue(QUEUE_NAMES.ANALYTICS);
   await reconciliation.upsertJobScheduler('outbox-dispatcher', { every: 5_000 }, {
     name: 'outbox-dispatch', data: {}, opts: { removeOnComplete: 20, removeOnFail: 100 },
   });
@@ -102,6 +117,11 @@ async function ensureMaintenanceJobs() {
       name: 'telegram-poll', data: {}, opts: { removeOnComplete: 10, removeOnFail: 50 },
     });
   }
+  const analyticsOpts = { attempts: 1, removeOnComplete: 20, removeOnFail: 100 };
+  await analytics.upsertJobScheduler('insights-collector', { every: 15 * 60_000 }, { name: 'collect-insights', data: {}, opts: analyticsOpts });
+  await analytics.upsertJobScheduler('slot-tuning', { pattern: '0 3 * * 1', tz: 'Asia/Kolkata' }, { name: 'tune-slots', data: {}, opts: analyticsOpts });
+  await analytics.upsertJobScheduler('account-health', { pattern: '0 8 * * *', tz: 'Asia/Kolkata' }, { name: 'account-health', data: {}, opts: analyticsOpts });
+  await analytics.upsertJobScheduler('daily-digest', { pattern: '30 22 * * *', tz: 'Asia/Kolkata' }, { name: 'daily-digest', data: {}, opts: analyticsOpts });
   await notifications.upsertJobScheduler('notification-dispatcher', { every: 10_000 }, {
     name: 'dispatch-notifications', data: {}, opts: { removeOnComplete: 20, removeOnFail: 100 },
   });

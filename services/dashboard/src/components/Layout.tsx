@@ -9,6 +9,7 @@ const navigation = [
   { href: '/', label: 'Overview', icon: '⌂' },
   { href: '/today', label: "Today's plan", icon: '◷' },
   { href: '/automation', label: 'Automation', icon: '↻' },
+  { href: '/insights', label: 'Insights', icon: '▲' },
   { href: '/calendar', label: 'Content calendar', icon: '▦' },
   { href: '/content/new', label: 'Create content', icon: '+' },
   { href: '/queues', label: 'Queue monitor', icon: '◌' },

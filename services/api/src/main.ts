@@ -15,6 +15,7 @@ import settingsRoutes from './routes/settings';
 import devRoutes from './routes/dev';
 import pipelineRoutes from './routes/pipeline';
 import plannerRoutes from './routes/planner';
+import insightsRoutes from './routes/insights';
 import { startMediaEdge } from './media-edge';
 
 const app = express();
@@ -57,6 +58,7 @@ app.use('/api', settingsRoutes);
 app.use('/api', devRoutes);
 app.use('/api', pipelineRoutes);
 app.use('/api', plannerRoutes);
+app.use('/api', insightsRoutes);
 
 app.use((_req, res) => {
   res.status(404).json({ error: 'Not found' });

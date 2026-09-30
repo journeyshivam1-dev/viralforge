@@ -21,4 +21,5 @@ export * from './src/adapters/meta-graph';
 export * from './src/security/token-crypto';
 export * from './src/security/media-url-signing';
 export * from './src/planner';
+export * from './src/insights';
 export * from './src/adapters/trends';

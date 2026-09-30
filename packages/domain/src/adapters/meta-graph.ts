@@ -7,6 +7,7 @@
  *   final publish call, so a crash never causes a duplicate post.
  */
 import { MediaProviderError, MediaProviderErrorClassification } from './media-adapter';
+import { facebookMetrics, flattenGraphInsights, instagramMetrics, type PostMetrics } from '../insights';
 
 export interface MetaGraphConfig {
   accessToken: string;
@@ -202,4 +203,53 @@ export class MetaGraphClient {
       .catch(() => undefined);
     return { remoteId: started.video_id, containerId: started.video_id, permalink };
   }
+
+  // ------------------------------------------------------------------- Insights
+
+  /**
+   * Instagram media insights. Meta renames/retires metrics between versions,
+   * so an "invalid metric" rejection (code 100) falls back to a smaller set.
+   */
+  async getInstagramInsights(mediaId: string): Promise<{ metrics: PostMetrics; raw: Record<string, number> }> {
+    let flat: Record<string, number>;
+    try {
+      flat = flattenGraphInsights(await this.request('GET', `${mediaId}/insights`, { metric: IG_METRICS.join(',') }));
+    } catch (error) {
+      if ((error as MediaProviderError).providerCode !== 'META_100') throw error;
+      flat = flattenGraphInsights(await this.request('GET', `${mediaId}/insights`, { metric: IG_FALLBACK_METRICS.join(',') }));
+    }
+    return { metrics: instagramMetrics(flat), raw: flat };
+  }
+
+  /**
+   * Facebook post or reel counts from object fields (stable across versions);
+   * reach/plays come from insights on a best-effort basis.
+   */
+  async getFacebookInsights(remoteId: string, isReel: boolean): Promise<{ metrics: PostMetrics; raw: Record<string, number> }> {
+    const fields = await this.request<Record<string, unknown>>('GET', remoteId, {
+      fields: isReel
+        ? 'likes.summary(true).limit(0),comments.summary(true).limit(0)'
+        : 'reactions.summary(true).limit(0),comments.summary(true).limit(0),shares',
+    });
+    const flat = await this.request(
+      'GET',
+      isReel ? `${remoteId}/video_insights` : `${remoteId}/insights`,
+      { metric: isReel ? 'blue_reels_play_count,post_impressions_unique' : 'post_impressions_unique' },
+    ).then(flattenGraphInsights).catch((error: MediaProviderError) => {
+      if (error.classification === 'blocked') throw error;
+      return {} as Record<string, number>;
+    });
+    const metrics = facebookMetrics(fields, flat);
+    const raw: Record<string, number> = { ...flat };
+    for (const [key, value] of Object.entries(metrics)) if (typeof value === 'number') raw[`fields.${key}`] = value;
+    return { metrics, raw };
+  }
+
+  /** Cheapest call that proves the stored token can still act on the account. */
+  async verifyAccount(accountId: string): Promise<void> {
+    await this.request<{ id: string }>('GET', accountId, { fields: 'id' });
+  }
 }
+
+const IG_METRICS = ['reach', 'views', 'likes', 'comments', 'shares', 'saved', 'total_interactions'];
+const IG_FALLBACK_METRICS = ['reach', 'likes', 'comments', 'saved', 'shares'];

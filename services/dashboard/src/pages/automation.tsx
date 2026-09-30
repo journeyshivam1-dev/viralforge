@@ -11,6 +11,8 @@ type Settings = {
   publish_mode: 'manual_approval' | 'scheduled';
   auto_approve_at_slot: boolean;
   generation_lead_minutes: number;
+  slot_tuning: 'off' | 'suggest' | 'auto';
+  exploration_minutes: number;
 };
 
 type Topic = { id: string; niche_id: string; title: string; angle?: string | null; scheduled_for?: string | null; status: string; priority: number; media_type?: string | null };
@@ -61,6 +63,8 @@ export default function AutomationPage() {
           publish_mode: entry.publish_mode,
           auto_approve_at_slot: entry.auto_approve_at_slot,
           generation_lead_minutes: entry.generation_lead_minutes,
+          slot_tuning: entry.slot_tuning,
+          exploration_minutes: entry.exploration_minutes,
         }),
       });
       setNotice(`${entry.niche_id} saved. Changes apply from the next planned day.`);
@@ -115,6 +119,16 @@ export default function AutomationPage() {
             ))}
             <div className="field"><label>Generation lead (minutes)</label>
               <input type="number" min={30} max={720} value={entry.generation_lead_minutes} onChange={(e) => update(entry.niche_id, { generation_lead_minutes: Number(e.target.value) || 150 })} />
+            </div>
+            <div className="field"><label>Posting-time tuning</label>
+              <select value={entry.slot_tuning} onChange={(e) => update(entry.niche_id, { slot_tuning: e.target.value as Settings['slot_tuning'] })}>
+                <option value="suggest">Suggest better times</option>
+                <option value="auto">Apply better times automatically</option>
+                <option value="off">Off</option>
+              </select>
+            </div>
+            <div className="field"><label>Exploration (± minutes, one slot a day)</label>
+              <input type="number" min={0} max={90} disabled={entry.slot_tuning === 'off'} value={entry.exploration_minutes} onChange={(e) => update(entry.niche_id, { exploration_minutes: Math.min(90, Math.max(0, Number(e.target.value) || 0)) })} />
             </div>
             <div className="field full"><label>Slots (IST, comma separated)</label>
               <input value={entry.slots_ist.join(', ')} onChange={(e) => update(entry.niche_id, { slots_ist: e.target.value.split(',').map((slot) => slot.trim()).filter(Boolean) })} placeholder="07:30, 12:30, 17:30, 19:30, 21:30" />

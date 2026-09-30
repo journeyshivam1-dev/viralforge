@@ -2,7 +2,7 @@
  * Notification dispatcher. Drains notification_outbox (filled by DB triggers on
  * permanent failures, blocks and approval requests) to Telegram and WhatsApp.
  * Approval requests go to Telegram with a media preview and one-tap
- * Approve / Reject buttons. Unconfigured channels are marked skipped.
+ * Approve / Reject buttons; slot recommendations get Apply / Dismiss. Unconfigured channels are marked skipped.
  */
 import { Job } from 'bullmq';
 import { requireSupabaseAdmin } from '@viralforge/supabase';
@@ -56,6 +56,12 @@ export async function notificationWorker(_job: Job) {
 
 async function sendTelegram(eventType: string, payload: NotificationPayload, contentItemId: string | null, text: string): Promise<NotificationResult> {
   const config = telegramConfigFromEnv();
+  if (eventType === 'slot_recommendation' && payload.recommendationId) {
+    return sendTelegramMessage(config, text, [[
+      { text: '✅ Apply', callbackData: `slots_apply:${payload.recommendationId}` },
+      { text: '✖ Dismiss', callbackData: `slots_dismiss:${payload.recommendationId}` },
+    ]]);
+  }
   if (eventType !== 'approval_requested' || !payload.runId || !contentItemId) {
     return sendTelegramMessage(config, text);
   }

@@ -17,6 +17,9 @@ export interface NicheScheduleSettings {
   publish_mode: 'manual_approval' | 'scheduled';
   auto_approve_at_slot: boolean;
   generation_lead_minutes: number;
+  slot_tuning?: 'off' | 'suggest' | 'auto';
+  /** One slot per day is shifted by +/- this many minutes to learn about nearby times. */
+  exploration_minutes?: number;
 }
 
 export const DEFAULT_SLOTS_IST = ['07:30', '12:30', '17:30', '19:30', '21:30'];
@@ -28,6 +31,8 @@ export interface PlannedSlot {
   scheduledAt: Date;
   /** HH:MM IST after jitter, for display. */
   slotIst: string;
+  /** Non-zero on the day's exploration slot. */
+  explorationOffsetMinutes: number;
 }
 
 /** Current calendar date in IST as YYYY-MM-DD. */
@@ -76,9 +81,30 @@ export function mediaTypeSequence(mix: Partial<Record<MediaType, number>>, count
   return sequence.slice(0, count);
 }
 
+/**
+ * Picks the day's exploration slot and direction deterministically. Returns
+ * offset 0 when the shift would leave the day or come within 45 minutes of
+ * another slot, so exploration never bunches posts together.
+ */
+export function explorationShift(date: string, nicheId: string, slots: string[], minutes: number): { slotIndex: number; offsetMinutes: number } {
+  if (!minutes || minutes <= 0 || slots.length === 0) return { slotIndex: -1, offsetMinutes: 0 };
+  const hash = crypto.createHash('sha256').update(`${date}:${nicheId}:explore`).digest();
+  const slotIndex = hash.readUInt32BE(0) % slots.length;
+  const minuteOf = (slot: string) => Number(slot.slice(0, 2)) * 60 + Number(slot.slice(3, 5));
+  const base = minuteOf(slots[slotIndex]);
+  const preferred = hash[4] % 2 === 0 ? -minutes : minutes;
+  for (const offset of [preferred, -preferred]) {
+    const target = base + offset;
+    const clear = slots.every((slot, index) => index === slotIndex || Math.abs(minuteOf(slot) - target) >= 45);
+    if (target >= 0 && target <= 1439 && clear) return { slotIndex, offsetMinutes: offset };
+  }
+  return { slotIndex, offsetMinutes: 0 };
+}
+
 export function buildSlotPlan(
   date: string,
-  settings: Pick<NicheScheduleSettings, 'niche_id' | 'posts_per_day' | 'content_mix' | 'slots_ist' | 'jitter_minutes'>,
+  settings: Pick<NicheScheduleSettings, 'niche_id' | 'posts_per_day' | 'content_mix' | 'slots_ist' | 'jitter_minutes'>
+    & Partial<Pick<NicheScheduleSettings, 'slot_tuning' | 'exploration_minutes'>>,
 ): PlannedSlot[] {
   const slots = [...(settings.slots_ist.length ? settings.slots_ist : DEFAULT_SLOTS_IST)].sort();
   const count = Math.min(settings.posts_per_day, slots.length);
@@ -87,9 +113,14 @@ export function buildSlotPlan(
   const chosen = count === slots.length
     ? slots
     : Array.from({ length: count }, (_, i) => slots[Math.round((i * (slots.length - 1)) / Math.max(1, count - 1))]);
+  const exploring = settings.slot_tuning && settings.slot_tuning !== 'off'
+    ? explorationShift(date, settings.niche_id, chosen, settings.exploration_minutes ?? 0)
+    : { slotIndex: -1, offsetMinutes: 0 };
   return chosen.map((slot, slotIndex) => {
-    const scheduledAt = istToUtc(date, slot, jitterFor(`${date}:${settings.niche_id}:${slotIndex}`, settings.jitter_minutes));
-    return { slotIndex, mediaType: types[slotIndex], scheduledAt, slotIst: formatIst(scheduledAt) };
+    const explorationOffsetMinutes = slotIndex === exploring.slotIndex ? exploring.offsetMinutes : 0;
+    const offset = jitterFor(`${date}:${settings.niche_id}:${slotIndex}`, settings.jitter_minutes) + explorationOffsetMinutes;
+    const scheduledAt = istToUtc(date, slot, offset);
+    return { slotIndex, mediaType: types[slotIndex], scheduledAt, slotIst: formatIst(scheduledAt), explorationOffsetMinutes };
   });
 }
 

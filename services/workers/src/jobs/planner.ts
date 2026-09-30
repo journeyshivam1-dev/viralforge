@@ -36,6 +36,7 @@ import {
   type PlannedSlot,
   type TrendItem,
 } from '@viralforge/domain';
+import { enqueueOperationsAlert } from './operations';
 
 const supabase = requireSupabaseAdmin();
 const aiChain = createAiProviderChainFromEnv();
@@ -79,6 +80,13 @@ export async function plannerWorker(job: Job<PlannerJobData>) {
           .eq('organization_id', organizationId).eq('plan_date', date).eq('niche_id', nicheSettings.niche_id);
         summary.push({ date, niche: nicheSettings.niche_id, error: message });
         console.error(`[Planner] ${date} ${nicheSettings.niche_id} failed: ${message}`);
+        // Once per niche and date; the 30-minute catch-up keeps retrying silently.
+        await enqueueOperationsAlert(organizationId, 'planner_failed', `${date}-${nicheSettings.niche_id}`, {
+          nicheId: nicheSettings.niche_id,
+          lines: [`Could not plan ${date}. Retrying every 30 minutes.`],
+          errorMessage: message.slice(0, 500),
+          dashboardPath: '/today',
+        });
       }
     }
   }
@@ -325,7 +333,7 @@ async function createContentItems(
       media_type: slot.mediaType,
       status: 'draft',
       trigger_source: 'calendar',
-      trigger_metadata: { planner: true, planDate: date, slotIndex: slot.slotIndex, slotIst: slot.slotIst, topicSource: brief.source },
+      trigger_metadata: { planner: true, planDate: date, slotIndex: slot.slotIndex, slotIst: slot.slotIst, explorationOffsetMinutes: slot.explorationOffsetMinutes, topicSource: brief.source },
       scheduled_at: slot.scheduledAt.toISOString(),
       generation_lead_minutes: settings.generation_lead_minutes,
       publish_mode: settings.publish_mode,

@@ -31,6 +31,8 @@ const settingsSchema = z.object({
   publish_mode: z.enum(['manual_approval', 'scheduled']).optional(),
   auto_approve_at_slot: z.boolean().optional(),
   generation_lead_minutes: z.number().int().min(30).max(720).optional(),
+  slot_tuning: z.enum(['off', 'suggest', 'auto']).optional(),
+  exploration_minutes: z.number().int().min(0).max(90).optional(),
 }).strict();
 
 const topicSchema = z.object({

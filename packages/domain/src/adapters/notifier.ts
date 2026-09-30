@@ -199,6 +199,10 @@ export interface NotificationPayload {
   runId?: string;
   hook?: string;
   caption?: string;
+  /** Operations events (digest, account health, slot tuning) carry pre-built lines. */
+  lines?: string[];
+  recommendationId?: string;
+  dashboardPath?: string;
 }
 
 const EVENT_TITLES: Record<string, string> = {
@@ -206,7 +210,13 @@ const EVENT_TITLES: Record<string, string> = {
   stage_blocked: 'Pipeline blocked — needs attention',
   approval_requested: 'Content ready for approval',
   published: 'Content published',
+  planner_failed: 'Daily planner failed',
+  account_unhealthy: 'Connected account needs attention',
+  daily_digest: 'Daily digest',
+  slot_recommendation: 'Better posting times found',
 };
+
+const OPERATIONS_EVENTS = new Set(['planner_failed', 'account_unhealthy', 'daily_digest', 'slot_recommendation']);
 
 export function formatNotificationText(
   eventType: string,
@@ -214,6 +224,16 @@ export function formatNotificationText(
   contentItemId: string | null,
   dashboardUrl?: string,
 ): string {
+  if (OPERATIONS_EVENTS.has(eventType)) {
+    const lines = [`ViralForge: ${EVENT_TITLES[eventType]}`];
+    if (payload.nicheId) lines.push(`Niche: ${payload.nicheId}`);
+    lines.push(...(payload.lines || []).map((line) => String(line).slice(0, 300)).slice(0, 40));
+    if (payload.errorMessage) lines.push(`Error: ${payload.errorCode ? `[${payload.errorCode}] ` : ''}${payload.errorMessage}`);
+    if (dashboardUrl && payload.dashboardPath && /^\/[a-z0-9/_-]*$/i.test(payload.dashboardPath)) {
+      lines.push(`Open: ${dashboardUrl.replace(/\/$/, '')}${payload.dashboardPath}`);
+    }
+    return lines.join('\n');
+  }
   const slot = payload.scheduledAt
     ? new Date(payload.scheduledAt).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', dateStyle: 'medium', timeStyle: 'short' }) + ' IST'
     : 'unscheduled';

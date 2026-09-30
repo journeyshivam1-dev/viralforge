@@ -368,23 +368,39 @@ export class MetaOAuth {
   }
 
   /**
-   * Generate OAuth URL for user to grant permissions
+   * Generate OAuth URL for user to grant permissions.
+   *
+   * Uses the Facebook Login for Business flow when a config_id is provided,
+   * otherwise falls back to the legacy raw-scope dialog. The legacy scopes
+   * (pages_show_list, pages_read_engagement, pages_manage_posts,
+   * instagram_basic, instagram_content_publish, instagram_manage_insights)
+   * are deprecated for new app users and will be silently ignored by Meta.
+   * When config_id is set, Meta uses the configured permission set instead.
    */
-  getAuthorizationUrl(state: string, scopes: string[] = [
-    'pages_show_list',
-    'pages_read_engagement',
-    'pages_manage_posts',
-    'instagram_basic',
-    'instagram_content_publish',
-    'instagram_manage_insights',
-  ]): string {
+  getAuthorizationUrl(
+    state: string,
+    scopes: string[] = [
+      'pages_show_list',
+      'pages_read_engagement',
+      'pages_manage_posts',
+      'instagram_basic',
+      'instagram_content_publish',
+      'instagram_manage_insights',
+    ],
+    configId?: string
+  ): string {
     const params = new URLSearchParams({
       client_id: this.appId,
       redirect_uri: this.redirectUri,
       state,
-      scope: scopes.join(','),
       response_type: 'code',
     });
+
+    if (configId) {
+      params.set('config_id', configId);
+    } else {
+      params.set('scope', scopes.join(','));
+    }
 
     return `${this.dialogUrl}?${params.toString()}`;
   }

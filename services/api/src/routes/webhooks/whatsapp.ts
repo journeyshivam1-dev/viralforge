@@ -180,16 +180,19 @@ async function processMessage(body: any) {
     case 'generate':
     case 'create':
     case 'post':
-      const { queueContentGeneration } = await import('../../queues/content-queue');
-
-      const job = await queueContentGeneration({
-        nicheId: parsed.niche as any,
-        subTopic: parsed.topic || 'Quick recipe',
+      const { createContentAndStartPipeline } = await import('../../queues/content-queue');
+      const { ensureDefaultOrganization } = await import('../_helpers');
+      const organizationId = await ensureDefaultOrganization();
+      const nicheId = (parsed.niche || 'food') as any;
+      const topic = parsed.topic || 'Quick recipe';
+      const job = await createContentAndStartPipeline({
+        organizationId,
+        nicheId,
+        subTopic: topic,
+        dataInputPayload: buildTriggerPayload(nicheId, topic),
         triggerSource: 'whatsapp',
-        triggerMetadata: {
-          whatsappFrom: from,
-          requestedTime: parsed.time
-        }
+        triggerMetadata: { whatsappFrom: from, requestedTime: parsed.time },
+        idempotencyKey: `whatsapp-${message.id}`,
       });
 
       await sendWhatsAppMessage(from,
@@ -202,6 +205,18 @@ async function processMessage(body: any) {
         '🔄 System operational। All services healthy।'
       );
       break;
+  }
+}
+
+function buildTriggerPayload(niche: string, topic: string): Record<string, unknown> {
+  switch (niche) {
+    case 'food': return { dish: topic, region: 'India' };
+    case 'health': return { originalDish: topic, transformedDish: `Healthy ${topic}` };
+    case 'tech': return { toolName: topic };
+    case 'edtech': return { exam: topic };
+    case 'travel': return { location: topic };
+    case 'cartoon': return { dialect: topic };
+    default: return { topic };
   }
 }
 

@@ -15,21 +15,29 @@
     "dev:api": "npm run dev --workspace=services/api",
     "dev:workers": "npm run dev --workspace=services/workers",
     "dev:dashboard": "npm run dev --workspace=services/dashboard",
-    "build": "npm run build --workspaces",
-    "start": "npm run start --workspaces",
-    "lint": "npm run lint --workspaces",
-    "test": "npm run test --workspaces",
-    "migrate": "npm run migrate --workspace=services/api",
-    "docker:up": "docker-compose up -d",
-    "docker:down": "docker-compose down",
-    "docker:logs": "docker-compose logs -f"
+    "build": "npm run build --workspace=packages/domain && npm run build --workspace=packages/supabase && npm run build --workspace=services/api && npm run build --workspace=services/workers && npm run build --workspace=services/dashboard",
+    "start": "concurrently \"npm run start --workspace=services/api\" \"npm run start --workspace=services/workers\" \"npm run start --workspace=services/dashboard\"",
+    "lint": "npm run lint --workspaces --if-present",
+    "test": "jest --config jest.config.cjs",
+    "supabase:start": "supabase start",
+    "supabase:stop": "supabase stop",
+    "supabase:status": "supabase status",
+    "supabase:reset": "supabase db reset",
+    "supabase:test": "supabase test db",
+    "migrate": "npm run supabase:reset",
+    "infra:up": "npm run supabase:start && docker compose up -d redis",
+    "infra:down": "docker compose down && npm run supabase:stop",
+    "docker:up": "docker compose --profile app up -d",
+    "docker:down": "docker compose down",
+    "docker:logs": "docker compose logs -f"
   },
   "devDependencies": {
     "concurrently": "^8.2.2",
+    "supabase": "2.117.0",
     "turbo": "^1.11.2"
   },
   "engines": {
-    "node": ">=20.0.0",
+    "node": ">=22.0.0",
     "npm": ">=10.0.0"
   }
 }

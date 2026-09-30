@@ -2,51 +2,114 @@
 
 ## Prerequisites
 
-- Node.js 20+
-- Docker Desktop
+- Node.js 22 or newer
+- npm 10 or newer
+- Docker Desktop, running with Linux containers
 - Git
 
-## Local Development
+## 1. Install dependencies
 
-1. Copy environment template:
-```bash
-cp .env.example .env
-```
-
-2. Start infrastructure:
-```bash
-docker compose up -d postgres redis minio
-```
-
-3. Install dependencies:
 ```bash
 npm install
 ```
 
-4. Start dev services:
+The repository pins the Supabase CLI, so use the npm scripts instead of installing a global CLI.
+
+## 2. Start local Supabase
+
+```bash
+npm run supabase:start
+```
+
+Local endpoints:
+
+- Data API and Storage: http://127.0.0.1:54321
+- PostgreSQL: 127.0.0.1:54322
+- Studio: http://127.0.0.1:54323
+- Local email viewer: http://127.0.0.1:54324
+
+## 3. Configure environment variables
+
+Copy `.env.example` to `.env`. Get the current local credentials with:
+
+```bash
+npm run supabase:status
+```
+
+Set `SUPABASE_ANON_KEY` and `SUPABASE_SERVICE_ROLE_KEY` to the reported local values. Do not commit `.env`.
+
+For Replicate-backed media generation, set `REPLICATE_API_TOKEN` and `REPLICATE_IMAGE_MODEL_VERSION`. `REPLICATE_VIDEO_MODEL_VERSION` is optional and enables video generation. `REPLICATE_TIMEOUT_MS` bounds prediction creation and polling together. Store real tokens only in `.env` or your deployment secret manager; never commit them.
+
+Keep `PUBLISHING_DISABLED=true` in local development. Meta cannot fetch media from local signed URLs.
+
+## 4. Apply migrations
+
+```bash
+npm run supabase:reset
+```
+
+This recreates the local database from `supabase/migrations`, provisions the private `viralforge-content` bucket, and runs `supabase/seed.sql`.
+
+## 5. Start Redis
+
+```bash
+docker compose up -d redis
+```
+
+PostgreSQL and Storage are intentionally not in `docker-compose.yml`; the Supabase CLI owns those services.
+
+## 6. Start the application
+
 ```bash
 npm run dev
 ```
 
-Services will be available at:
+Services:
+
 - Dashboard: http://localhost:3001
 - API: http://localhost:3000
 - Omniroute: http://localhost:20128
 
-## Database Migrations
+To create the local organization, niche profiles, and sample content, call `POST /api/dev/bootstrap` after the API starts.
 
-Migrations run automatically on Postgres startup via docker-compose volume mount.
+## Run in application containers
 
-## Testing
-
-```bash
-npm run test
-```
-
-## Production Deployment
+Start Supabase first, copy its keys into `.env`, then run:
 
 ```bash
-docker compose up -d
+docker compose --profile app up -d --build
 ```
 
-All services will start with production settings.
+Application containers reach the CLI stack through `host.docker.internal:54321`.
+
+## Verification
+
+```bash
+npm test -- --runInBand
+```
+
+```bash
+npm run build
+```
+
+```bash
+npm run supabase:test
+```
+
+```bash
+npx supabase db lint --local --fail-on error
+```
+
+## Shutdown
+
+```bash
+docker compose down
+```
+
+```bash
+npm run supabase:stop
+```
+
+## Hosted deployment
+
+Hosted Supabase uses the same migrations, but production secrets, public media delivery, authentication, tenant policies, and encrypted Meta credentials must be configured before enabling publishing.

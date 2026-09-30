@@ -8,7 +8,13 @@ dist/
 build/
 *.tsbuildinfo
 .next/
+.next-dev/
+services/dashboard/.next-dev/
 out/
+
+# Local Claude scratch / unrelated work
+.claude/pdf-work/
+EXPECTED_PAPER_1_ANALYSIS.md
 *.log
 
 # Environment files

@@ -4,7 +4,9 @@
  */
 
 import { Job } from 'bullmq';
-import { supabase } from '@viralforge/supabase';
+import { requireSupabaseAdmin } from '@viralforge/supabase';
+
+const supabase = requireSupabaseAdmin();
 import { OmnirouteAdapter } from '@viralforge/domain';
 import { createOmnirouteAdapter } from '@viralforge/domain';
 import { NicheId } from '@viralforge/domain';
@@ -18,7 +20,18 @@ const omnirouteAdapter: OmnirouteAdapter = createOmnirouteAdapter(
 );
 
 export async function generationWorker(job: Job) {
-  const { contentItemId, nicheId, dataInputPayload, triggerSource } = job.data;
+  const triggerMetadata = job.data?.triggerMetadata || {};
+  const contentItemId = job.data?.contentItemId || triggerMetadata.contentItemId;
+  const nicheId = job.data?.nicheId || triggerMetadata.nicheId;
+  const dataInputPayload = job.data?.dataInputPayload || triggerMetadata.dataInputPayload;
+  const triggerSource = job.data?.triggerSource || 'manual';
+
+  if (!contentItemId) {
+    throw new Error('contentItemId is required in job.data or job.data.triggerMetadata');
+  }
+  if (!nicheId) {
+    throw new Error(`nicheId is required for content ${contentItemId}`);
+  }
 
   console.log(`[Generation] Starting generation for content ${contentItemId}`);
 
@@ -48,40 +61,59 @@ export async function generationWorker(job: Job) {
 
     await job.updateProgress(30);
 
-    // Build the generation prompt
-    const prompt = buildPrompt(nicheId as NicheId, dataInputPayload || contentItem.data_input_payload, promptTemplate?.prompt_text);
+    const inputPayload = dataInputPayload || contentItem.data_input_payload || {};
+    const prompt = buildPrompt(nicheId as NicheId, inputPayload, promptTemplate?.prompt_text);
 
-    // Call Omniroute for text generation
-    const omnirouteResponse = await omnirouteAdapter.generateContent({
-      type: 'text',
-      prompt,
-      niche: nicheId as NicheId,
-      callbackUrl: process.env.API_URL ? `${process.env.API_URL}/webhooks/omniroute` : undefined,
+    const generation = await omnirouteAdapter.generateText({
+      model: process.env.OMNIROUTE_TEXT_MODEL || 'auto/best-chat',
+      responseFormat: 'json_object',
+      temperature: 0.7,
+      maxTokens: 4000,
+      messages: [
+        {
+          role: 'system',
+          content: `You are ViralForge's editorial generator for Hindi/Hinglish ${nicheId} social content. Return JSON only. Do not make unverified claims.`,
+        },
+        {
+          role: 'user',
+          content: `${prompt}\n\nReturn exactly this JSON object shape:\n{\n  "primaryHook": "string",\n  "alternateHooks": ["string", "string"],\n  "script": "string",\n  "caption": "string",\n  "hashtags": ["string"],\n  "cta": "string",\n  "scenes": [{"index": 1, "durationSeconds": 4, "voiceover": "string", "onScreenText": "string", "visualPrompt": "string"}],\n  "disclosures": ["string"]\n}\nUse Devanagari Hindi or natural Hinglish as appropriate. The script must be at least 80 characters and scenes must be a non-empty array.`,
+        },
+      ],
     });
 
+    console.log(`[Generation] Raw Omniroute response for ${contentItemId}:`, generation.content.substring(0, 500));
     await job.updateProgress(60);
 
-    // Parse generated content
-    const generatedContent = parseGeneratedContent(omnirouteResponse.result?.text || '', nicheId as NicheId);
-
-    // Generate hooks (multiple variations for A/B testing)
-    const hooks = await generateHooks(nicheId as NicheId, dataInputPayload, promptTemplate?.prompt_text);
+    const generatedContent = parseStructuredContent(generation.content, contentItemId);
 
     await job.updateProgress(80);
 
-    // Update content item with generated content
+    // Update content item only after the real Omniroute response passes validation.
     const { error: updateError } = await supabase
       .from('content_items')
       .update({
         status: 'generated',
-        hook_variation_a: hooks.primary,
+        hook_variation_a: generatedContent.primaryHook,
         script_body: generatedContent.script,
+        cta_destination: generatedContent.cta,
         ai_generation_metadata: {
-          omnirouteJobId: omnirouteResponse.id,
+          provider: 'omniroute',
+          omnirouteJobId: generation.id,
           generatedAt: new Date().toISOString(),
-          model: 'omniroute',
+          model: generation.model,
+          usage: generation.usage,
+          generatedContent: {
+            schemaVersion: 1,
+            ...generatedContent,
+          },
+          alternateHooks: generatedContent.alternateHooks,
+          caption: generatedContent.caption,
+          hashtags: generatedContent.hashtags,
+          scenes: generatedContent.scenes,
+          disclosures: generatedContent.disclosures,
         },
-        validation_warnings: generatedContent.warnings,
+        validation_errors: [],
+        validation_warnings: [],
       })
       .eq('id', contentItemId);
 
@@ -91,12 +123,13 @@ export async function generationWorker(job: Job) {
 
     await job.updateProgress(100);
 
-    // Log audit event
     await logAuditEvent(contentItemId, 'generation.completed', {
       nicheId,
       triggerSource,
-      hookVariation: hooks.primary.substring(0, 50),
+      hookVariation: generatedContent.primaryHook.substring(0, 50),
       scriptLength: generatedContent.script.length,
+      sceneCount: generatedContent.scenes.length,
+      model: generation.model,
     });
 
     console.log(`[Generation] Generation completed for content ${contentItemId}`);
@@ -104,9 +137,10 @@ export async function generationWorker(job: Job) {
     return {
       success: true,
       contentItemId,
-      hook: hooks.primary,
+      hook: generatedContent.primaryHook,
       script: generatedContent.script,
-      alternativeHooks: hooks.alternatives,
+      alternativeHooks: generatedContent.alternateHooks,
+      scenes: generatedContent.scenes.length,
     };
   } catch (error) {
     console.error(`[Generation] Error for content ${contentItemId}:`, error);
@@ -226,80 +260,133 @@ function interpolateTemplate(template: string, data: Record<string, any>): strin
   return result;
 }
 
-/**
- * Parse generated content based on niche
- */
-function parseGeneratedContent(
-  text: string,
-  nicheId: NicheId
-): { script: string; warnings: string[] } {
-  const warnings: string[] = [];
-
-  // Basic parsing - in production, use structured JSON output
-  if (!text || text.length < 50) {
-    warnings.push('Generated script is very short');
-  }
-
-  return {
-    script: text,
-    warnings,
-  };
+interface GeneratedScene {
+  index: number;
+  durationSeconds: number;
+  voiceover: string;
+  onScreenText: string;
+  visualPrompt: string;
 }
 
-/**
- * Generate multiple hook variations for A/B testing
- */
-async function generateHooks(
-  nicheId: NicheId,
-  dataInput: Record<string, any>,
-  template?: string
-): Promise<{ primary: string; alternatives: string[] }> {
-  const hooks: Record<NicheId, { primary: string; alternatives: string[] }> = {
-    food: {
-      primary: `Kya aapko ${dataInput.dish || 'ye dish'} banana aata hai? 🤔`,
-      alternatives: [
-        `Is tarike se ${dataInput.dish || 'ye dish'} banaye toh family bolengi "ek aur!"`,
-        `Har ghar mein banne wali ${dataInput.dish || 'ye dish'} ka ultimate version!`,
-      ],
-    },
-    health: {
-      primary: `Is dish ko ${dataInput.calorieDelta || 100} calories kam karke banao!`,
-      alternatives: [
-        `Har day ${dataInput.originalDish || 'ye dish'} khate ho? Yeh swap zaroor try karo!`,
-        `Weight loss ke liye bas yahi ek chij change karo!`,
-      ],
-    },
-    tech: {
-      primary: `${dataInput.toolName || 'Yeh tool'} aapki ${dataInput.timeSaved || 2} hours bachayega!`,
-      alternatives: [
-        `Boss, agar aap yeh tool nahi use karte toh time waste hai!`,
-        `${dataInput.feature || 'Productivity'} ke liye yeh tool hai game-changer!`,
-      ],
-    },
-    edtech: {
-      primary: `${dataInput.cheatCode || 'Yeh trick'} ${dataInput.exam || 'exam'} mein 10 marks laayegi!`,
-      alternatives: [
-        `Agar yeh ${dataInput.topic || 'topic'} aapne nahi padha toh regret hoga!`,
-        `${dataInput.exam} crack karne ka sabse easy tarika - yeh dekh lo!`,
-      ],
-    },
-    travel: {
-      primary: `${dataInput.location || 'Yeh jagah'} ${dataInput.baseCity || 'shahar'} ke bahut kareeb hai, but log nahi jaate!`,
-      alternatives: [
-        `₹${dataInput.budgetPerHead || 500} mein ${dataInput.location || 'yeh place'} explore karo!`,
-        `Most people don't know about this hidden gem near ${dataInput.baseCity || 'your city'}!`,
-      ],
-    },
-    cartoon: {
-      primary: `Aapke ghar mein bhi ${dataInput.theme || 'yeh situation'} hota hai na? 😂`,
-      alternatives: [
-        `Yeh ${dataInput.dialect || 'Bambaiya'} style comedy aapki mummy ko bhi hasayegi!`,
-        `Indian family problems ka ultimate compilation - relatable hai toh share karo!`,
-      ],
-    },
-  };
+interface StructuredGeneratedContent {
+  primaryHook: string;
+  alternateHooks: string[];
+  script: string;
+  caption: string;
+  hashtags: string[];
+  cta: string;
+  scenes: GeneratedScene[];
+  disclosures: string[];
+}
 
-  return hooks[nicheId] || hooks.food;
+function parseStructuredContent(text: string, contentItemId?: string): StructuredGeneratedContent {
+  let parseableText = text.trim();
+
+  // Pass 1: strip markdown code fences (```json ... ``` or ``` ... ```)
+  const fenceMatch = parseableText.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fenceMatch) {
+    parseableText = fenceMatch[1].trim();
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(parseableText);
+  } catch {
+    // Pass 2: tolerate gateways that wrap JSON in markdown or prose.
+    const jsonObject = extractJsonObject(parseableText);
+    if (jsonObject) {
+      try {
+        parsed = JSON.parse(jsonObject);
+      } catch {
+        // Fall through to the descriptive error below.
+      }
+    }
+
+    if (parsed === undefined) {
+      console.error(`[Generation] Failed to parse JSON for content ${contentItemId}. Raw response (first 1000 chars):`, text.substring(0, 1000));
+      throw new Error(`Omniroute returned invalid JSON instead of the requested structured content package. Raw response preview: ${text.substring(0, 200)}`);
+    }
+  }
+
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('Omniroute returned an invalid content package');
+  }
+
+  const value = parsed as Record<string, unknown>;
+  const primaryHook = typeof value.primaryHook === 'string' ? value.primaryHook.trim() : '';
+  const script = typeof value.script === 'string' ? value.script.trim() : '';
+  const caption = typeof value.caption === 'string' ? value.caption.trim() : '';
+  const cta = typeof value.cta === 'string' ? value.cta.trim() : '';
+  const alternateHooks = Array.isArray(value.alternateHooks)
+    ? value.alternateHooks.filter((hook): hook is string => typeof hook === 'string' && hook.trim().length > 0)
+    : [];
+  const hashtags = Array.isArray(value.hashtags)
+    ? value.hashtags.filter((tag): tag is string => typeof tag === 'string' && tag.trim().length > 0)
+    : [];
+  const disclosures = Array.isArray(value.disclosures)
+    ? value.disclosures.filter((disclosure): disclosure is string => typeof disclosure === 'string')
+    : [];
+  const scenes = Array.isArray(value.scenes)
+    ? value.scenes.map((scene, index): GeneratedScene => {
+        const entry = scene as Record<string, unknown>;
+        return {
+          index: typeof entry.index === 'number' ? entry.index : index + 1,
+          durationSeconds: typeof entry.durationSeconds === 'number' ? entry.durationSeconds : 0,
+          voiceover: typeof entry.voiceover === 'string' ? entry.voiceover.trim() : '',
+          onScreenText: typeof entry.onScreenText === 'string' ? entry.onScreenText.trim() : '',
+          visualPrompt: typeof entry.visualPrompt === 'string' ? entry.visualPrompt.trim() : '',
+        };
+      })
+    : [];
+
+  if (!primaryHook || !caption || script.length < 80 || !cta || scenes.length === 0) {
+    throw new Error('Omniroute content package is incomplete: hook, script, caption, CTA, and at least one scene are required');
+  }
+
+  if (scenes.some((scene) => !scene.voiceover || !scene.visualPrompt || scene.durationSeconds <= 0)) {
+    throw new Error('Omniroute content package contains an invalid scene');
+  }
+
+  return { primaryHook, alternateHooks, script, caption, hashtags, cta, scenes, disclosures };
+}
+
+function extractJsonObject(text: string): string | null {
+  const start = text.indexOf('{');
+  if (start === -1) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index];
+
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+
+    if (char === '\\') {
+      escaped = true;
+      continue;
+    }
+
+    if (char === '"') {
+      inString = !inString;
+      continue;
+    }
+
+    if (inString) continue;
+
+    if (char === '{') depth += 1;
+    if (char === '}') depth -= 1;
+
+    if (depth === 0) {
+      return text.slice(start, index + 1).trim();
+    }
+  }
+
+  return null;
 }
 
 async function logAuditEvent(

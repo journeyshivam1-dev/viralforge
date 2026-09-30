@@ -108,8 +108,8 @@ router.post('/omniroute', async (req: Request, res: Response) => {
         await failJob(job.id, payload.error || 'Unknown error');
 
         // Update content item status
-        const { supabase } = await import('@viralforge/supabase');
-        await supabase
+        const { requireSupabaseAdmin } = await import('@viralforge/supabase');
+        await requireSupabaseAdmin()
           .from('content_items')
           .update({
             status: 'failed',

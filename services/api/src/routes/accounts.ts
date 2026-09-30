@@ -1,7 +1,9 @@
 import crypto from 'crypto';
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
-import { supabase } from '@viralforge/supabase';
+import { requireSupabaseAdmin } from '@viralforge/supabase';
+
+const supabase = requireSupabaseAdmin();
 import { createMetaOAuth } from '@viralforge/domain';
 import { asyncRoute, ensureDefaultOrganization, sendError } from './_helpers';
 
@@ -38,10 +40,18 @@ function getOAuthConfig() {
   const appId = process.env.META_APP_ID || '';
   const appSecret = process.env.META_APP_SECRET || '';
   const redirectUri = process.env.META_OAUTH_REDIRECT_URI || '';
+  const loginConfigId = process.env.META_LOGIN_CONFIG_ID || '';
+  const allowLegacyScopes = process.env.META_ALLOW_LEGACY_META_SCOPES === 'true';
+
   if (!appId || appId.startsWith('your-') || !appSecret || appSecret.startsWith('your-') || !redirectUri) {
     throw new Error('Meta OAuth is not configured. Set META_APP_ID, META_APP_SECRET, and META_OAUTH_REDIRECT_URI.');
   }
-  return { appId, appSecret, redirectUri };
+
+  if (!loginConfigId && !allowLegacyScopes) {
+    throw new Error('Meta OAuth requires META_LOGIN_CONFIG_ID for Facebook Login for Business. Create a Login for Business configuration in Meta Developer Dashboard and set META_LOGIN_CONFIG_ID. Keep META_OAUTH_REDIRECT_URI=http://localhost:3000/api/accounts/meta/callback for local API callback.');
+  }
+
+  return { appId, appSecret, redirectUri, loginConfigId };
 }
 
 function cleanupExpiredStates() {
@@ -65,14 +75,14 @@ router.get('/accounts', asyncRoute(async (_req, res) => {
 
 router.get('/accounts/meta/connect-url', asyncRoute(async (_req, res) => {
   const organizationId = await ensureDefaultOrganization();
-  const { appId, appSecret, redirectUri } = getOAuthConfig();
+  const { appId, appSecret, redirectUri, loginConfigId } = getOAuthConfig();
   cleanupExpiredStates();
   const state = crypto.randomBytes(32).toString('hex');
   oauthStates.set(state, { organizationId, expiresAt: Date.now() + stateTtlMs });
   const oauth = createMetaOAuth(appId, appSecret, redirectUri);
   res.json({
     ok: true,
-    authorizationUrl: oauth.getAuthorizationUrl(state),
+    authorizationUrl: oauth.getAuthorizationUrl(state, undefined, loginConfigId),
     expiresAt: new Date(Date.now() + stateTtlMs).toISOString(),
   });
 }));

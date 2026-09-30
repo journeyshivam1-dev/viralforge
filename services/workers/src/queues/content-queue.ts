@@ -1,73 +1,50 @@
-import { v4 as uuidv4 } from 'uuid';
-import { getQueue, QUEUE_NAMES } from './connection';
-import type { NicheId, TriggerSource } from '@viralforge/domain';
+/**
+ * Worker-side stage helpers. Durable stage progression is performed by
+ * complete_stage_attempt(); these exports remain for scheduler compatibility.
+ */
+import { PipelineStage } from '@viralforge/domain';
+import { requireSupabaseAdmin } from '@viralforge/supabase';
 
-export interface ContentJobData {
-  contentItemId?: string;
-  nicheId: NicheId;
-  subTopic?: string;
-  dataInputPayload?: Record<string, unknown>;
-  triggerSource: TriggerSource;
-  triggerMetadata?: Record<string, unknown>;
-  scheduledAt?: Date;
-  idempotencyKey?: string;
+async function enqueueStageForContent(contentItemId: string, stage: PipelineStage) {
+  const admin = requireSupabaseAdmin();
+  const { data: run, error } = await admin.from('pipeline_runs').select('id').eq('content_item_id', contentItemId)
+    .in('status', ['pending', 'running', 'waiting', 'failed']).order('created_at', { ascending: false }).limit(1).maybeSingle();
+  if (error || !run) throw new Error(`No pipeline run found for content ${contentItemId}`);
+  const { data: attemptId, error: enqueueError } = await admin.rpc('enqueue_pipeline_attempt', {
+    p_run_id: run.id,
+    p_stage: stage,
+    p_available_at: new Date().toISOString(),
+  });
+  if (enqueueError) throw new Error(`Failed to queue ${stage}: ${enqueueError.message}`);
+  return { id: String(attemptId), contentItemId, runId: run.id, queue: 'database-outbox' };
 }
 
-export async function queueContentGeneration(data: ContentJobData) {
-  const contentItemId = data.contentItemId || uuidv4();
-  const job = await getQueue(QUEUE_NAMES.RESEARCH).add('research', {
-    ...data,
-    contentItemId,
-    idempotencyKey: data.idempotencyKey ?? `research-${contentItemId}`,
-  }, { jobId: uuidv4() });
-
-  return { id: job.id!, contentItemId, queue: QUEUE_NAMES.RESEARCH };
-}
-
-export async function queueTextGeneration(data: ContentJobData) {
+export function queueTextGeneration(data: { contentItemId?: string }) {
   if (!data.contentItemId) throw new Error('contentItemId is required for generation');
-  const job = await getQueue(QUEUE_NAMES.GENERATION).add('generate-text', {
-    ...data,
-    idempotencyKey: data.idempotencyKey ?? `generation-${data.contentItemId}`,
-  }, { jobId: uuidv4() });
-
-  return { id: job.id!, contentItemId: data.contentItemId, queue: QUEUE_NAMES.GENERATION };
+  return enqueueStageForContent(data.contentItemId, 'generation');
 }
+export function queueMediaGeneration(contentItemId: string) { return enqueueStageForContent(contentItemId, 'media'); }
+export function queueRendering(contentItemId: string) { return enqueueStageForContent(contentItemId, 'rendering'); }
+export function queueValidation(contentItemId: string) { return enqueueStageForContent(contentItemId, 'validation'); }
+export function queuePublishing(contentItemId: string) { return enqueueStageForContent(contentItemId, 'publishing'); }
 
-export async function queueMediaGeneration(contentItemId: string, nicheId: NicheId) {
-  const job = await getQueue(QUEUE_NAMES.MEDIA).add('generate-media', {
-    contentItemId,
-    nicheId,
-    idempotencyKey: `media-${contentItemId}`,
-  }, { jobId: uuidv4() });
-
-  return { id: job.id!, contentItemId, queue: QUEUE_NAMES.MEDIA };
-}
-
-export async function queueRendering(contentItemId: string) {
-  const job = await getQueue(QUEUE_NAMES.RENDERING).add('render', {
-    contentItemId,
-    jobId: uuidv4(),
+export async function queueContentGeneration(data: { contentItemId?: string; organizationId?: string }) {
+  if (!data.contentItemId) throw new Error('contentItemId is required; scheduler must use the existing content ID');
+  const admin = requireSupabaseAdmin();
+  let organizationId = data.organizationId;
+  if (!organizationId) {
+    const { data: item, error } = await admin.from('content_items').select('organization_id').eq('id', data.contentItemId).single();
+    if (error || !item) throw new Error(`Content item not found: ${error?.message}`);
+    organizationId = item.organization_id;
+  }
+  const { data: runId, error } = await admin.rpc('start_content_pipeline', {
+    p_content_item_id: data.contentItemId,
+    p_organization_id: organizationId,
+    p_requested_by: 'scheduler',
+    p_start_stage: 'research',
+    p_config_snapshot: {},
+    p_available_at: new Date().toISOString(),
   });
-
-  return { id: job.id!, contentItemId, queue: QUEUE_NAMES.RENDERING };
-}
-
-export async function queueValidation(contentItemId: string) {
-  const job = await getQueue(QUEUE_NAMES.VALIDATION).add('validate', {
-    contentItemId,
-    jobId: uuidv4(),
-  });
-
-  return { id: job.id!, contentItemId, queue: QUEUE_NAMES.VALIDATION };
-}
-
-export async function queuePublishing(contentItemId: string, scheduledAt?: Date) {
-  const delay = scheduledAt ? Math.max(0, scheduledAt.getTime() - Date.now()) : 0;
-  const job = await getQueue(QUEUE_NAMES.PUBLISHING).add('publish', {
-    contentItemId,
-    jobId: uuidv4(),
-  }, { delay, attempts: 1 });
-
-  return { id: job.id!, contentItemId, queue: QUEUE_NAMES.PUBLISHING };
+  if (error) throw new Error(`Failed to start scheduled pipeline: ${error.message}`);
+  return { id: String(runId), runId: String(runId), contentItemId: data.contentItemId, queue: 'database-outbox' };
 }

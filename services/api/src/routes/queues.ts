@@ -43,6 +43,17 @@ router.get('/queues/:name/jobs', asyncRoute(async (req, res) => {
   res.json({ ok: true, jobs: jobs.map(serializeJob) });
 }));
 
+router.get('/queues/:name/jobs/:id', asyncRoute(async (req, res) => {
+  if (!queueValues.includes(req.params.name as typeof queueValues[number])) {
+    return sendError(res, 404, 'Unknown queue');
+  }
+  const queue = getQueue(req.params.name);
+  const job = await queue.getJob(req.params.id);
+  if (!job) return sendError(res, 404, 'Job not found');
+  const state = await job.getState().catch(() => undefined);
+  res.json({ ok: true, job: { ...serializeJob(job), state } });
+}));
+
 router.post('/queues/:name/jobs/:id/retry', asyncRoute(async (req, res) => {
   if (!queueValues.includes(req.params.name as typeof queueValues[number])) {
     return sendError(res, 404, 'Unknown queue');

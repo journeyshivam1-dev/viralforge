@@ -2,6 +2,12 @@
   "name": "@viralforge/domain",
   "version": "1.0.0",
   "private": true,
-  "main": "index.ts",
-  "types": "index.ts"
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "zod": "^3.25.76"
+  }
 }

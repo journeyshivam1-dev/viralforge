@@ -121,17 +121,22 @@ router.post('/telegram', async (req: Request, res: Response) => {
       case 'create':
       case 'post':
         // Queue content generation job
-        const { queueContentGeneration } = await import('../../queues/content-queue');
-
-        const job = await queueContentGeneration({
-          nicheId: parsed.niche as any,
+        const { createContentAndStartPipeline } = await import('../../queues/content-queue');
+        const { ensureDefaultOrganization } = await import('../_helpers');
+        const organizationId = await ensureDefaultOrganization();
+        const nicheId = (parsed.niche || 'food') as any;
+        const job = await createContentAndStartPipeline({
+          organizationId,
+          nicheId,
           subTopic: parsed.topic || 'Quick recipe',
+          dataInputPayload: buildTriggerPayload(nicheId, parsed.topic || 'Quick recipe'),
           triggerSource: 'telegram',
           triggerMetadata: {
             telegramChatId: chatId,
             telegramUserId: userId,
             requestedTime: parsed.time
-          }
+          },
+          idempotencyKey: `telegram-${message.message_id}`,
         });
 
         return res.json({
@@ -193,6 +198,18 @@ export async function setWebhook(webhookUrl: string): Promise<boolean> {
   } catch (error) {
     console.error('Failed to set Telegram webhook:', error);
     return false;
+  }
+}
+
+function buildTriggerPayload(niche: string, topic: string): Record<string, unknown> {
+  switch (niche) {
+    case 'food': return { dish: topic, region: 'India' };
+    case 'health': return { originalDish: topic, transformedDish: `Healthy ${topic}` };
+    case 'tech': return { toolName: topic };
+    case 'edtech': return { exam: topic };
+    case 'travel': return { location: topic };
+    case 'cartoon': return { dialect: topic };
+    default: return { topic };
   }
 }
 

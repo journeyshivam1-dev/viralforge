@@ -1,6 +1,9 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { supabase } from '@viralforge/supabase';
+import { requireSupabaseAdmin } from '@viralforge/supabase';
+
+const supabase = requireSupabaseAdmin();
+const storage = supabase.storage;
 import { validatePayload } from '@viralforge/domain';
 import {
   queueContentGeneration,
@@ -28,6 +31,8 @@ const contentSchema = z.object({
   ai_disclosure_required: z.boolean().default(false),
   status: z.enum(['draft', 'queued', 'researched', 'generated', 'rendering', 'validated', 'scheduled', 'publishing', 'published', 'blocked', 'failed', 'cancelled']).default('draft'),
   scheduled_at: z.string().datetime().optional().nullable(),
+  publish_mode: z.enum(['manual_approval', 'immediate_auto', 'scheduled']).default('manual_approval'),
+  generation_lead_minutes: z.number().int().min(0).max(10080).default(120),
 });
 
 router.get('/content', asyncRoute(async (req, res) => {
@@ -68,6 +73,9 @@ router.post('/content', asyncRoute(async (req, res) => {
   const payloadErrors = validatePayload(parsed.data.niche_id, parsed.data.data_input_payload);
   if (payloadErrors.length > 0) return sendError(res, 400, 'Invalid niche payload', payloadErrors);
 
+  if (parsed.data.publish_mode === 'scheduled' && !parsed.data.scheduled_at) {
+    return sendError(res, 400, 'scheduled_at is required when publish_mode is scheduled');
+  }
   const orgId = await ensureDefaultOrganization();
   const { data, error } = await supabase
     .from('content_items')
@@ -166,7 +174,7 @@ router.post('/content/:id/generate', asyncRoute(async (req, res) => {
     return sendError(res, 409, `Generation requires researched content; current status is ${content.status}`);
   }
 
-  const job = await queueTextGeneration(content.id, content.niche_id, content.data_input_payload, 'manual');
+  const job = await queueTextGeneration(content.id);
   await supabase.from('content_items').update({ status: 'queued', validation_errors: [], updated_at: new Date().toISOString() }).eq('id', content.id);
   res.json({ ok: true, job, message: 'Omniroute text generation queued' });
 }));
@@ -175,29 +183,50 @@ router.post('/content/:id/media', asyncRoute(async (req, res) => {
   const { data: content, error } = await supabase.from('content_items').select('*').eq('id', req.params.id).single();
   if (error || !content) return sendError(res, 404, 'Content item not found', error?.message);
   if (content.status !== 'generated') return sendError(res, 409, `Media generation requires generated content; current status is ${content.status}`);
-  const job = await queueMediaGeneration(content.id, content.niche_id);
+  if (content.ai_generation_metadata?.mediaUrl) return sendError(res, 409, 'Media has already been generated or uploaded');
+  const job = await queueMediaGeneration(content.id);
   res.json({ ok: true, job, message: 'Media generation queued' });
+}));
+
+router.post('/content/:id/media/force', asyncRoute(async (req, res) => {
+  // Manual trigger that ignores the "already generated" guard so users can
+  // re-run media generation for a content item whose auto-run failed.
+  const { data: content, error } = await supabase.from('content_items').select('*').eq('id', req.params.id).single();
+  if (error || !content) return sendError(res, 404, 'Content item not found', error?.message);
+  if (content.status !== 'generated') return sendError(res, 409, `Media generation requires generated content; current status is ${content.status}`);
+  const job = await queueMediaGeneration(content.id);
+  res.json({ ok: true, job, message: 'Media generation force-queued' });
 }));
 
 router.post('/content/:id/upload-media', asyncRoute(async (req, res) => {
   const { data: content, error } = await supabase.from('content_items').select('*').eq('id', req.params.id).single();
   if (error || !content) return sendError(res, 404, 'Content item not found', error?.message);
-  if (content.status !== 'generated') return sendError(res, 409, `Media upload requires generated content; current status is ${content.status}`);
+  // Allow upload from `generated` (direct path) or `validated` after an
+  // auto-generation failure recorded by the media worker.
+  if (!['generated', 'validated'].includes(content.status)) {
+    return sendError(res, 409, `Media upload requires generated or validated content; current status is ${content.status}`);
+  }
   if (content.ai_generation_metadata?.mediaUrl) return sendError(res, 409, 'Media has already been uploaded');
 
-  // Parse multipart form data
-  const formData = req.body as any;
-  if (!formData || !formData.file) {
-    return sendError(res, 400, 'No file provided in request body');
+  const body = req.body as { file?: string; mimeType?: string };
+  if (!body || !body.file) {
+    return sendError(res, 400, 'No file provided. Send a JSON body with a base64-encoded "file" field and optional "mimeType".');
   }
 
-  // Extract file from formData (this might need adjustment based on actual implementation)
-  const fileBuffer = formData.file instanceof Buffer ? formData.file : Buffer.from(formData.file);
-  const mimeType = formData.mimeType || 'application/octet-stream';
-  const fileName = `media-${Date.now()}.${mimeType.split('/')[1]}`;
+  let fileBuffer: Buffer;
+  try {
+    fileBuffer = Buffer.from(body.file, 'base64');
+  } catch {
+    return sendError(res, 400, 'Invalid base64 file data');
+  }
+  if (fileBuffer.length === 0) return sendError(res, 400, 'Empty file data');
+
+  const mimeType = body.mimeType || 'application/octet-stream';
+  const ext = mimeType.split('/')[1] || 'bin';
+  const fileName = `media-${Date.now()}.${ext}`;
 
   // Upload to Supabase storage
-  const { data: uploadData, error: uploadError } = await supabase
+  const { data: uploadData, error: uploadError } = await storage
     .from('viralforge-content')
     .upload(fileName, fileBuffer, {
       contentType: mimeType,
@@ -208,21 +237,35 @@ router.post('/content/:id/upload-media', asyncRoute(async (req, res) => {
     return sendError(res, 500, 'Failed to upload media', uploadError.message);
   }
 
-  // Update content item with media URL
+  // Images are ready to publish; videos go through the FFmpeg render worker
+  // for subtitles, logo overlay and music.
+  const isVideo = mimeType.startsWith('video/');
+  const nextStatus = isVideo ? 'rendering' : 'validated';
   const { error: updateError } = await supabase
     .from('content_items')
     .update({
-      status: 'validated',
+      status: nextStatus,
       ai_generation_metadata: {
         ...content.ai_generation_metadata,
         mediaUrl: uploadData.path,
         mediaType: mimeType,
+        uploadedAt: new Date().toISOString(),
       },
     })
     .eq('id', content.id);
 
   if (updateError) {
     return sendError(res, 500, 'Failed to update content item with media URL', updateError.message);
+  }
+
+  // Auto-queue the render worker for videos so the pipeline continues on its own.
+  let queuedRender: any = null;
+  if (isVideo) {
+    try {
+      queuedRender = await queueRendering(content.id);
+    } catch (e) {
+      console.warn('Failed to auto-queue rendering after upload:', e);
+    }
   }
 
   // Log audit event
@@ -233,10 +276,20 @@ router.post('/content/:id/upload-media', asyncRoute(async (req, res) => {
     action: 'content.media.uploaded',
     actor: 'dashboard',
     actor_type: 'user',
-    metadata: { fileName, mimeType },
+    metadata: { fileName, mimeType, size: fileBuffer.length, nextStatus },
   });
 
-  res.json({ ok: true, message: 'Media uploaded successfully', fileName });
+  res.json({
+    ok: true,
+    message: isVideo
+      ? 'Media uploaded and rendering queued'
+      : 'Media uploaded and ready for publishing',
+    fileName,
+    mediaUrl: uploadData.path,
+    size: fileBuffer.length,
+    nextStatus,
+    renderJob: queuedRender,
+  });
 }));
 
 router.post('/content/:id/render', asyncRoute(async (req, res) => {
@@ -271,7 +324,7 @@ router.post('/content/:id/publish', asyncRoute(async (req, res) => {
     return sendError(res, 409, `Cannot publish content in status ${content.status}`);
   }
 
-  const job = await queuePublishing(content.id, content.scheduled_at ? new Date(content.scheduled_at) : undefined);
+  const job = await queuePublishing(content.id);
   res.json({ ok: true, job });
 }));
 

@@ -4,7 +4,10 @@
  */
 
 import { Job } from 'bullmq';
-import { supabase, storage } from '@viralforge/supabase';
+import { requireSupabaseAdmin } from '@viralforge/supabase';
+
+const supabase = requireSupabaseAdmin();
+const storage = supabase.storage;
 import { createInstagramPublisher, createFacebookPublisher } from '@viralforge/domain';
 
 export async function publishingWorker(job: Job) {
@@ -14,9 +17,14 @@ export async function publishingWorker(job: Job) {
 
   try {
     // Check global kill switch
-    if (process.env.PUBLISHING_DISABLED === 'true') {
-      console.warn('[Publishing] PUBLISHING_DISABLED is true, skipping');
-      return { success: false, reason: 'kill_switch_engaged' };
+    if (process.env.PUBLISHING_DISABLED !== 'false') {
+      console.warn('[Publishing] Publishing disabled; package remains ready for approval');
+      return {
+        success: false,
+        blocked: true,
+        code: 'PUBLISHING_DISABLED',
+        reason: 'Publishing is disabled; generated package is ready for approval',
+      };
     }
 
     await job.updateProgress(10);
@@ -24,7 +32,7 @@ export async function publishingWorker(job: Job) {
     // Get content item
     const { data: contentItem, error: fetchError } = await supabase
       .from('content_items')
-      .select('*, niche_accounts(*), niche_profiles(*)')
+      .select('*, connected_accounts!content_items_niche_account_id_fkey(*)')
       .eq('id', contentItemId)
       .single();
 
@@ -45,7 +53,7 @@ export async function publishingWorker(job: Job) {
       .eq('id', contentItemId);
 
     // Get the account
-    const account = contentItem.niche_accounts;
+    const account = contentItem.connected_accounts;
     if (!account || account.status !== 'active') {
       throw new Error('Account is not active for publishing');
     }

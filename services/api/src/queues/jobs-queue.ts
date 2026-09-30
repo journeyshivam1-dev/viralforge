@@ -4,7 +4,9 @@
 
 import { Queue, Job } from 'bullmq';
 import { getQueue, QUEUE_NAMES } from './connection';
-import { supabase } from '@viralforge/supabase';
+import { requireSupabaseAdmin } from '@viralforge/supabase';
+
+const supabase = requireSupabaseAdmin();
 
 /**
  * Get job by Omniroute ID

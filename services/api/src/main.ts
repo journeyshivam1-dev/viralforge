@@ -13,6 +13,7 @@ import accountRoutes from './routes/accounts';
 import auditRoutes from './routes/audit';
 import settingsRoutes from './routes/settings';
 import devRoutes from './routes/dev';
+import pipelineRoutes from './routes/pipeline';
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
@@ -48,6 +49,7 @@ app.use('/api', accountRoutes);
 app.use('/api', auditRoutes);
 app.use('/api', settingsRoutes);
 app.use('/api', devRoutes);
+app.use('/api', pipelineRoutes);
 
 app.use((_req, res) => {
   res.status(404).json({ error: 'Not found' });

@@ -1,26 +1,31 @@
-FROM node:20-alpine AS builder
+FROM node:22-alpine AS builder
 
 WORKDIR /app
 
 COPY package.json package-lock.json ./
-COPY services/dashboard/package.json ./services/dashboard/package.json
 COPY services/api/package.json ./services/api/package.json
 COPY services/workers/package.json ./services/workers/package.json
+COPY services/dashboard/package.json ./services/dashboard/package.json
 COPY packages/domain/package.json ./packages/domain/package.json
 COPY packages/supabase/package.json ./packages/supabase/package.json
 
 RUN npm ci
 
+COPY tsconfig.json ./tsconfig.json
+COPY packages/domain/ ./packages/domain/
+COPY packages/supabase/ ./packages/supabase/
 COPY services/dashboard/ ./services/dashboard/
-COPY packages/ ./packages/
 
 ARG API_URL=http://api:3000
 ENV API_URL=$API_URL
 ENV NODE_ENV=production
 
-RUN npm run build --workspace=services/dashboard
+RUN npm run build --workspace=packages/domain \
+  && npm run build --workspace=packages/supabase \
+  && npm run build --workspace=services/dashboard \
+  && npm prune --omit=dev
 
-FROM node:20-alpine AS runner
+FROM node:22-alpine AS runner
 
 WORKDIR /app
 ENV NODE_ENV=production
@@ -28,16 +33,20 @@ ENV API_URL=http://api:3000
 
 COPY --from=builder /app/package.json /app/package-lock.json ./
 COPY --from=builder /app/node_modules/ ./node_modules/
-COPY --from=builder /app/services/dashboard/ ./services/dashboard/
-COPY --from=builder /app/packages/ ./packages/
+COPY --from=builder /app/packages/domain/package.json ./packages/domain/package.json
+COPY --from=builder /app/packages/domain/dist/ ./packages/domain/dist/
+COPY --from=builder /app/packages/supabase/package.json ./packages/supabase/package.json
+COPY --from=builder /app/packages/supabase/dist/ ./packages/supabase/dist/
+COPY --from=builder /app/services/dashboard/package.json ./services/dashboard/package.json
+COPY --from=builder /app/services/dashboard/.next/ ./services/dashboard/.next/
+COPY --from=builder /app/services/dashboard/next.config.js ./services/dashboard/next.config.js
 
 RUN addgroup -S appgroup && adduser -S appuser -G appgroup \
   && chown -R appuser:appgroup /app
-
 USER appuser
-EXPOSE 3001
 
+EXPOSE 3001
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-  CMD wget --no-verbose --tries=1 --spider http://localhost:3001/ || exit 1
+  CMD wget -q -T 2 -O /dev/null http://127.0.0.1:3001/ || exit 1
 
 CMD ["npm", "run", "start", "--workspace=services/dashboard"]

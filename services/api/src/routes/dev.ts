@@ -1,5 +1,7 @@
 import { Router } from 'express';
-import { supabase } from '@viralforge/supabase';
+import { requireSupabaseAdmin } from '@viralforge/supabase';
+
+const supabase = requireSupabaseAdmin();
 import { asyncRoute, ensureDefaultOrganization, sendError, SUPPORTED_NICHES } from './_helpers';
 
 const router = Router();

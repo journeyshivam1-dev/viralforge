@@ -1,109 +1,50 @@
 /**
- * Scheduler Worker
- * Cron-like job that queues scheduled content items
+ * Database-authoritative scheduler. BullMQ repeatable jobs only wake it up;
+ * content_items and pipeline state remain the source of truth.
  */
-
 import { Job } from 'bullmq';
-import { supabase } from '@viralforge/supabase';
-import {
-  queueContentGeneration,
-  queuePublishing,
-} from '../queues/content-queue';
+import { requireSupabaseAdmin } from '@viralforge/supabase';
 
-const SCHEDULE_WINDOW_MINUTES = 5; // Check 5 minutes ahead
+const LOOKAHEAD_MINUTES = Number(process.env.SCHEDULE_LOOKAHEAD_MINUTES || 15);
 
-export async function schedulerWorker(job: Job) {
-  console.log(`[Scheduler] Running scheduled job`);
+export async function schedulerWorker(_job: Job) {
+  const admin = requireSupabaseAdmin();
+  const now = new Date();
+  const windowEnd = new Date(now.getTime() + LOOKAHEAD_MINUTES * 60_000);
 
-  try {
-    const now = new Date();
-    const windowEnd = new Date(now.getTime() + SCHEDULE_WINDOW_MINUTES * 60 * 1000);
+  const { data: items, error } = await admin
+    .from('content_items')
+    .select('id, organization_id, scheduled_at, generation_lead_minutes, status')
+    .not('scheduled_at', 'is', null)
+    .in('status', ['draft', 'queued', 'failed'])
+    .lte('scheduled_at', windowEnd.toISOString())
+    .order('scheduled_at', { ascending: true });
+  if (error) throw new Error(`Failed to query scheduled content: ${error.message}`);
 
-    // Find content items scheduled to be published within the window
-    const { data: itemsToPublish, error: publishError } = await supabase
-      .from('content_items')
-      .select('*')
-      .eq('status', 'scheduled')
-      .lte('scheduled_at', windowEnd.toISOString())
-      .gte('scheduled_at', now.toISOString());
+  let started = 0;
+  let skipped = 0;
+  for (const item of items || []) {
+    const scheduledAt = new Date(item.scheduled_at);
+    const generationAt = new Date(scheduledAt.getTime() - Number(item.generation_lead_minutes || 120) * 60_000);
+    if (generationAt > now) { skipped += 1; continue; }
 
-    if (publishError) {
-      throw new Error(`Failed to fetch scheduled items: ${publishError.message}`);
+    const { error: startError } = await admin.rpc('start_content_pipeline', {
+      p_content_item_id: item.id,
+      p_organization_id: item.organization_id,
+      p_requested_by: 'scheduler',
+      p_start_stage: 'research',
+      p_config_snapshot: { scheduledAt: item.scheduled_at, generationLeadMinutes: item.generation_lead_minutes },
+      p_available_at: now.toISOString(),
+    });
+    if (startError) {
+      console.error(`[Scheduler] Could not start ${item.id}:`, startError.message);
+      skipped += 1;
+    } else {
+      started += 1;
     }
-
-    // Queue them for publishing
-    if (itemsToPublish) {
-      for (const item of itemsToPublish) {
-        await queuePublishing(item.id, new Date(item.scheduled_at));
-        console.log(`[Scheduler] Queued for publishing: ${item.id}`);
-      }
-    }
-
-    // Find items that need to enter the generation pipeline
-    const { data: itemsToGenerate, error: genError } = await supabase
-      .from('content_items')
-      .select('*')
-      .eq('status', 'queued')
-      .lte('scheduled_at', windowEnd.toISOString())
-      .gte('scheduled_at', now.toISOString());
-
-    if (genError) {
-      throw new Error(`Failed to fetch queued items: ${genError.message}`);
-    }
-
-    if (itemsToGenerate) {
-      for (const item of itemsToGenerate) {
-        await queueContentGeneration({
-          nicheId: item.niche_id,
-          subTopic: item.sub_topic,
-          dataInputPayload: item.data_input_payload,
-          triggerSource: 'calendar',
-          triggerMetadata: { scheduledAt: item.scheduled_at },
-        });
-        console.log(`[Scheduler] Queued for generation: ${item.id}`);
-      }
-    }
-
-    // Find past-due items that haven't been processed
-    const { data: overdueItems } = await supabase
-      .from('content_items')
-      .select('*')
-      .in('status', ['draft', 'queued'])
-      .lt('scheduled_at', now.toISOString());
-
-    if (overdueItems && overdueItems.length > 0) {
-      console.warn(`[Scheduler] Found ${overdueItems.length} overdue items`);
-
-      for (const item of overdueItems) {
-        await supabase
-          .from('content_items')
-          .update({
-            validation_warnings: [
-              ...(item.validation_warnings || []),
-              'Item was past-due and processed immediately',
-            ],
-          })
-          .eq('id', item.id);
-
-        await queueContentGeneration({
-          nicheId: item.niche_id,
-          subTopic: item.sub_topic,
-          dataInputPayload: item.data_input_payload,
-          triggerSource: 'calendar',
-          triggerMetadata: { wasOverdue: true },
-        });
-      }
-    }
-
-    return {
-      success: true,
-      queuedForPublishing: itemsToPublish?.length || 0,
-      queuedForGeneration: itemsToGenerate?.length || 0,
-      overdueItems: overdueItems?.length || 0,
-    };
-  } catch (error) {
-    console.error('[Scheduler] Error:', error);
-    throw error;
   }
-}
 
+  const { data: reconciliation, error: reconcileError } = await admin.rpc('reconcile_pipeline_work');
+  if (reconcileError) throw new Error(`Scheduler reconciliation failed: ${reconcileError.message}`);
+  return { success: true, started, skipped, reconciliation };
+}

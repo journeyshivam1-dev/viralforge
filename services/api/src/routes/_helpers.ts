@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { supabase } from '@viralforge/supabase';
+import { requireSupabaseAdmin } from '@viralforge/supabase';
 
 export const DEFAULT_ORG_EMAIL = 'local@viralforge.dev';
 export const DEFAULT_ORG_NAME = 'ViralForge Local Studio';
@@ -18,6 +18,7 @@ export function asyncRoute(handler: (req: Request, res: Response) => Promise<voi
 }
 
 export async function ensureDefaultOrganization(): Promise<string> {
+  const supabase = requireSupabaseAdmin();
   const { data: existing, error: existingError } = await supabase
     .from('organizations')
     .select('id')

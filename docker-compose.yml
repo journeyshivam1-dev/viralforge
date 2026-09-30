@@ -1,31 +1,8 @@
 services:
-  postgres:
-    image: postgres:16-alpine
-    container_name: viralforge-postgres
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-viralforge}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-viralforge}
-      POSTGRES_DB: ${POSTGRES_DB:-viralforge}
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./packages/supabase/migrations:/docker-entrypoint-initdb.d:ro
-    networks:
-      - viralforge-network
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
   redis:
     image: redis:7-alpine
     container_name: viralforge-redis
-    command: >
-      sh -c 'if [ -n "$$REDIS_PASSWORD" ]; then redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD"; else redis-server --appendonly yes; fi'
-    environment:
-      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+    command: ["redis-server", "--appendonly", "yes"]
     ports:
       - "6379:6379"
     volumes:
@@ -38,27 +15,8 @@ services:
       timeout: 5s
       retries: 5
 
-  minio:
-    image: minio/minio:latest
-    container_name: viralforge-minio
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
-    ports:
-      - "9000:9000"
-      - "9001:9001"
-    volumes:
-      - minio_data:/data
-    networks:
-      - viralforge-network
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live"]
-      interval: 30s
-      timeout: 20s
-      retries: 3
-
   api:
+    profiles: ["app"]
     build:
       context: .
       dockerfile: infra/docker/Dockerfile.api
@@ -69,42 +27,38 @@ services:
       NODE_ENV: production
       PORT: 3000
       REDIS_URL: redis://redis:6379
-      S3_ENDPOINT: http://minio:9000
-      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
-      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
-      S3_BUCKET: viralforge-content
+      SUPABASE_URL: http://host.docker.internal:54321
       OMNIROUTE_BASE_URL: http://host.docker.internal:20128
+      PUBLISHING_DISABLED: "true"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "3000:3000"
     depends_on:
-      postgres:
-        condition: service_healthy
       redis:
-        condition: service_healthy
-      minio:
         condition: service_healthy
     networks:
       - viralforge-network
     restart: unless-stopped
 
   worker:
+    profiles: ["app"]
     build:
       context: .
       dockerfile: infra/docker/Dockerfile.worker
+    container_name: viralforge-worker
     env_file:
       - .env
     environment:
       NODE_ENV: production
       REDIS_URL: redis://redis:6379
-      S3_ENDPOINT: http://minio:9000
-      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
-      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
-      S3_BUCKET: viralforge-content
-      CONTENT_GENERATION_PROVIDER: omniroute
+      SUPABASE_URL: http://host.docker.internal:54321
       OMNIROUTE_BASE_URL: http://host.docker.internal:20128
+      PUBLISHING_DISABLED: "true"
+      API_URL: http://api:3000
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
-      postgres:
-        condition: service_healthy
       redis:
         condition: service_healthy
     networks:
@@ -112,12 +66,13 @@ services:
     restart: unless-stopped
 
   dashboard:
+    profiles: ["app"]
     build:
       context: .
       dockerfile: infra/docker/Dockerfile.dashboard
+      args:
+        API_URL: http://api:3000
     container_name: viralforge-dashboard
-    env_file:
-      - .env
     environment:
       NODE_ENV: production
       PORT: 3001
@@ -125,7 +80,8 @@ services:
     ports:
       - "3001:3001"
     depends_on:
-      - api
+      api:
+        condition: service_healthy
     networks:
       - viralforge-network
     restart: unless-stopped
@@ -146,9 +102,7 @@ services:
       - monitoring
 
 volumes:
-  postgres_data:
   redis_data:
-  minio_data:
 
 networks:
   viralforge-network:

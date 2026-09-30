@@ -1,318 +1,205 @@
-/**
- * Rendering Worker
- * Composes final video with FFmpeg - adds subtitles, logo, music
- */
-
 import { Job } from 'bullmq';
-import { supabase, storage } from '@viralforge/supabase';
-import { exec } from 'child_process';
+import { requireSupabaseAdmin } from '@viralforge/supabase';
+import { MediaManifestSchema, RenderManifestSchema, type SceneArtifact } from '@viralforge/domain';
+import { execFile } from 'child_process';
 import { promisify } from 'util';
-import { promises as fs, existsSync } from 'fs';
+import { promises as fs } from 'fs';
 import path from 'path';
+import os from 'os';
 
-const execAsync = promisify(exec);
-
-const TEMP_DIR = process.env.TEMP_DIR || '/tmp/viralforge';
+const execFileAsync = promisify(execFile);
+const supabase = requireSupabaseAdmin();
+const storage = supabase.storage;
+const TEMP_DIR = process.env.TEMP_DIR || path.join(os.tmpdir(), 'viralforge');
 
 export async function renderingWorker(job: Job) {
-  const { contentItemId } = job.data;
-
-  console.log(`[Rendering] Starting rendering for content ${contentItemId}`);
+  const { contentItemId } = job.data as { contentItemId: string };
+  const workDir = path.join(TEMP_DIR, `${contentItemId}-${job.id || Date.now()}`);
 
   try {
-    await job.updateProgress(10);
-
-    // Get content item with all data
-    const { data: contentItem, error: fetchError } = await supabase
+    const { data: contentItem, error } = await supabase
       .from('content_items')
-      .select('*, niche_profiles(*)')
+      .select('*')
       .eq('id', contentItemId)
       .single();
+    if (error || !contentItem) throw new Error(`Content item not found: ${contentItemId}`);
 
-    if (fetchError || !contentItem) {
-      throw new Error(`Content item not found: ${contentItemId}`);
+    const parsed = MediaManifestSchema.safeParse(contentItem.ai_generation_metadata?.mediaManifest);
+    if (!parsed.success) throw new Error('Valid media manifest is required before rendering');
+    const mediaManifest = parsed.data;
+    const artifacts = [...mediaManifest.artifacts].sort((a, b) => a.sceneIndex - b.sceneIndex);
+    if (artifacts.length === 0) throw new Error('Media manifest contains no artifacts');
+
+    await fs.mkdir(workDir, { recursive: true });
+    await job.updateProgress(10);
+
+    const sourcePaths: string[] = [];
+    for (const artifact of artifacts) {
+      const storagePath = String(artifact.metadata?.storagePath || '');
+      if (!storagePath) throw new Error(`Scene ${artifact.sceneIndex} has no private storage path`);
+      const extension = artifact.kind === 'video' ? 'mp4' : mimeExtension(artifact.mimeType);
+      const localPath = path.join(workDir, `scene-${artifact.sceneIndex}.${extension}`);
+      const { data, error: downloadError } = await storage.from('viralforge-content').download(storagePath);
+      if (downloadError || !data) throw new Error(`Failed to download scene ${artifact.sceneIndex}: ${downloadError?.message}`);
+      await fs.writeFile(localPath, Buffer.from(await data.arrayBuffer()));
+      sourcePaths.push(localPath);
     }
 
-    await job.updateProgress(20);
+    const generatedScenes = contentItem.ai_generation_metadata?.generatedContent?.scenes
+      || contentItem.ai_generation_metadata?.scenes
+      || [];
+    const durations = artifacts.map((artifact) => {
+      const scene = generatedScenes.find((candidate: any) => Number(candidate.index) === artifact.sceneIndex);
+      return Math.max(1, Number(artifact.durationSeconds || scene?.durationSeconds || 4));
+    });
+    const totalDuration = durations.reduce((sum, duration) => sum + duration, 0);
 
-    // Ensure temp directory exists
-    await fs.mkdir(TEMP_DIR, { recursive: true });
+    const subtitlePath = path.join(workDir, 'subtitles.srt');
+    await writeSceneSubtitles(generatedScenes, contentItem.script_body || '', durations, subtitlePath);
 
-    // Download source media
-    const mediaUrl = contentItem.ai_generation_metadata?.mediaUrl;
-    if (!mediaUrl) {
-      throw new Error('No source media URL found');
-    }
+    const outputPath = path.join(workDir, 'final.mp4');
+    await renderSequence(sourcePaths, artifacts, durations, subtitlePath, outputPath);
+    await job.updateProgress(85);
 
-    const sourcePath = path.join(TEMP_DIR, `source-${contentItemId}.mp4`);
-    const { data: mediaData, error: downloadError } = await storage
-      .from('viralforge-content')
-      .download(mediaUrl);
+    const outputBuffer = await fs.readFile(outputPath);
+    const finalStoragePath = `media/${contentItemId}/final.mp4`;
+    const { error: uploadError } = await storage.from('viralforge-content').upload(
+      finalStoragePath,
+      outputBuffer,
+      { contentType: 'video/mp4', cacheControl: '31536000', upsert: true },
+    );
+    if (uploadError) throw new Error(`Failed to upload rendered video: ${uploadError.message}`);
 
-    if (downloadError) {
-      throw new Error(`Failed to download source media: ${downloadError.message}`);
-    }
-
-    await fs.writeFile(sourcePath, Buffer.from(await mediaData.arrayBuffer()));
-
-    await job.updateProgress(40);
-
-    // Download music if specified
-    let musicPath: string | null = null;
-    if (contentItem.background_music) {
-      musicPath = path.join(TEMP_DIR, `music-${contentItemId}.mp3`);
-      const { data: musicData } = await storage
-        .from('viralforge-content')
-        .download(`music/${contentItem.background_music}.mp3`);
-
-      if (musicData) {
-        await fs.writeFile(musicPath, Buffer.from(await musicData.arrayBuffer()));
-      } else {
-        musicPath = null;
-      }
-    }
-
-    await job.updateProgress(50);
-
-    // Download logo
-    const logoPath = path.join(TEMP_DIR, `logo-${contentItemId}.png`);
-    const logoUrl = contentItem.niche_profiles?.brand_logo_url;
-
-    if (logoUrl) {
-      try {
-        const { data: logoData } = await storage
-          .from('viralforge-content')
-          .download(logoUrl);
-
-        if (logoData) {
-          await fs.writeFile(logoPath, Buffer.from(await logoData.arrayBuffer()));
-        }
-      } catch (e) {
-        console.warn('Logo download failed, skipping watermark');
-      }
-    }
-
-    await job.updateProgress(60);
-
-    // Generate subtitle file from script
-    const subtitlePath = path.join(TEMP_DIR, `subs-${contentItemId}.srt`);
-    await generateSubtitles(contentItem.script_body, subtitlePath);
-
-    await job.updateProgress(70);
-
-    // Render final video with FFmpeg
-    const outputPath = path.join(TEMP_DIR, `output-${contentItemId}.mp4`);
-    await renderVideo({
-      sourcePath,
-      outputPath,
-      subtitlePath,
-      musicPath,
-      logoPath: existsSync(logoPath) ? logoPath : null,
-      contentItem,
+    const renderManifest = RenderManifestSchema.parse({
+      schemaVersion: 1,
+      contentItemId,
+      mediaManifest,
+      output: {
+        url: `storage://viralforge-content/${finalStoragePath}`,
+        mimeType: 'video/mp4',
+        width: 1080,
+        height: 1920,
+        durationSeconds: totalDuration,
+        sizeBytes: outputBuffer.length,
+      },
+      renderedAt: new Date().toISOString(),
+      renderer: 'ffmpeg-scene-sequence-v1',
     });
 
-    await job.updateProgress(90);
-
-    // Upload rendered video
-    const outputBuffer = await fs.readFile(outputPath);
-    const finalPath = `${contentItem.niche_id}/${contentItemId}/final-${Date.now()}.mp4`;
-
-    const { data: uploadData, error: uploadError } = await storage
-      .from('viralforge-content')
-      .upload(finalPath, outputBuffer, {
-        contentType: 'video/mp4',
-        cacheControl: '31536000',
-      });
-
-    if (uploadError) {
-      throw new Error(`Failed to upload rendered video: ${uploadError.message}`);
-    }
+    const { error: updateError } = await supabase.from('content_items').update({
+      status: 'rendering',
+      rendering_manifest: {
+        ...renderManifest,
+        finalMediaUrl: `storage://viralforge-content/${finalStoragePath}`,
+        duration: totalDuration,
+        codec: 'h264',
+        resolution: '1080x1920',
+      },
+      validation_errors: [],
+    }).eq('id', contentItemId);
+    if (updateError) throw new Error(`Failed to persist render manifest: ${updateError.message}`);
 
     await job.updateProgress(100);
-
-    // Update content item
-    await supabase
-      .from('content_items')
-      .update({
-        status: 'validated',
-        rendering_manifest: {
-          finalMediaUrl: uploadData.path,
-          duration: contentItem.data_input_payload?.duration || 30,
-          codec: 'h264',
-          resolution: '1080x1920',
-          renderedAt: new Date().toISOString(),
-        },
-      })
-      .eq('id', contentItemId);
-
-    // Clean up temp files
-    await cleanupFiles([sourcePath, subtitlePath, outputPath, musicPath, logoPath].filter(Boolean) as string[]);
-
-    // Log audit event
     await logAuditEvent(contentItemId, 'rendering.completed', {
-      outputPath: uploadData.path,
+      outputPath: finalStoragePath,
+      sceneCount: artifacts.length,
+      durationSeconds: totalDuration,
     });
 
-    console.log(`[Rendering] Rendering completed for content ${contentItemId}`);
-
-    return {
-      success: true,
-      contentItemId,
-      outputPath: uploadData.path,
-    };
-  } catch (error) {
-    console.error(`[Rendering] Error for content ${contentItemId}:`, error);
-
-    await supabase
-      .from('content_items')
-      .update({
-        status: 'failed',
-        validation_errors: [error instanceof Error ? error.message : String(error)],
-      })
-      .eq('id', contentItemId);
-
-    throw error;
+    return { success: true, contentItemId, outputPath: finalStoragePath, renderManifest };
+  } finally {
+    await fs.rm(workDir, { recursive: true, force: true }).catch(() => undefined);
   }
 }
 
-/**
- * Render video with FFmpeg
- */
-async function renderVideo(params: {
-  sourcePath: string;
-  outputPath: string;
-  subtitlePath: string;
-  musicPath: string | null;
-  logoPath: string | null;
-  contentItem: any;
-}) {
-  const { sourcePath, outputPath, subtitlePath, musicPath, logoPath, contentItem } = params;
-
-  // Build FFmpeg command
-  let command = `ffmpeg -y -i "${sourcePath}" `;
-
-  // Add music if available (mixed at 25% volume)
-  if (musicPath) {
-    command += `-i "${musicPath}" `;
-  }
-
-  // Add logo if available
-  if (logoPath) {
-    command += `-i "${logoPath}" `;
-  }
-
-  // Build filter complex for compositing
-  const filters: string[] = [];
-
-  // Base video settings: 9:16 vertical, 1080x1920
-  filters.push('[0:v]scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2[v0]');
-
-  // Add subtitles
-  filters.push(`[v0]subtitles=${subtitlePath}:force_style='FontName=Noto Sans Devanagari,FontSize=24,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,BorderStyle=3,Outline=2,Alignment=2'[v1]`);
-
-  let lastVideo = '[v1]';
-
-  // Add logo overlay
-  if (logoPath) {
-    const logoIndex = musicPath ? 2 : 1;
-    filters.push(`[${logoIndex}:v]scale=120:-1[logo]`);
-    filters.push(`${lastVideo}[logo]overlay=30:30[outv]`);
-    lastVideo = '[outv]';
-  } else {
-    filters.push(`${lastVideo}null[outv]`);
-  }
-
-  command += `-filter_complex "${filters.join(';')}" -map "${lastVideo}" `;
-
-  // Audio mixing
-  if (musicPath) {
-    // Mix original audio (voiceover) with music at 25% volume
-    command += `-map 0:a -map 1:a -filter_complex "[0:a]volume=1.0[vo];[1:a]volume=0.25[music];[vo][music]amix=inputs=2:duration=longest[outa]" -map "[outa]" `;
-  } else {
-    command += `-map 0:a `;
-  }
-
-  // Output settings
-  command += `-c:v libx264 -preset medium -crf 23 -c:a aac -b:a 128k -movflags +faststart "${outputPath}"`;
-
-  console.log(`[Rendering] FFmpeg command: ${command}`);
-
-  try {
-    const { stdout, stderr } = await execAsync(command, {
-      maxBuffer: 50 * 1024 * 1024, // 50MB buffer
-    });
-
-    if (stderr) {
-      console.log('[FFmpeg stderr]:', stderr.substring(stderr.length - 500));
+async function renderSequence(
+  sourcePaths: string[],
+  artifacts: SceneArtifact[],
+  durations: number[],
+  subtitlePath: string,
+  outputPath: string,
+): Promise<void> {
+  const args: string[] = ['-y'];
+  sourcePaths.forEach((sourcePath, index) => {
+    if (artifacts[index].kind === 'image') {
+      args.push('-loop', '1', '-t', String(durations[index]), '-i', sourcePath);
+    } else {
+      args.push('-i', sourcePath);
     }
-  } catch (error: any) {
-    console.error('[FFmpeg] Rendering failed:', error.message);
-    throw new Error(`Video rendering failed: ${error.message}`);
-  }
-}
-
-/**
- * Generate SRT subtitle file from script text
- */
-async function generateSubtitles(script: string, outputPath: string): Promise<void> {
-  // Split script into words and time them
-  const words = script.split(/\s+/).filter(w => w.length > 0);
-  const totalWords = words.length;
-  const totalDuration = 45; // seconds
-  const secondsPerWord = totalDuration / totalWords;
-
-  // Group words into subtitle chunks (4-5 words each)
-  const chunkSize = 5;
-  const chunks: string[][] = [];
-  for (let i = 0; i < words.length; i += chunkSize) {
-    chunks.push(words.slice(i, i + chunkSize));
-  }
-
-  let srtContent = '';
-  chunks.forEach((chunk, index) => {
-    const startTime = index * chunkSize * secondsPerWord;
-    const endTime = (index + 1) * chunkSize * secondsPerWord;
-
-    srtContent += `${index + 1}\n`;
-    srtContent += `${formatSrtTime(startTime)} --> ${formatSrtTime(Math.min(endTime, totalDuration))}\n`;
-    srtContent += `${chunk.join(' ')}\n\n`;
   });
 
-  await fs.writeFile(outputPath, srtContent, 'utf-8');
+  const filters = sourcePaths.map((_, index) =>
+    `[${index}:v]scale=1080:1920:force_original_aspect_ratio=decrease,`+
+    `pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,`+
+    `trim=duration=${durations[index]},setpts=PTS-STARTPTS[v${index}]`,
+  );
+  const inputs = sourcePaths.map((_, index) => `[v${index}]`).join('');
+  filters.push(`${inputs}concat=n=${sourcePaths.length}:v=1:a=0[concatv]`);
+  filters.push(`[concatv]subtitles=${escapeFilterPath(subtitlePath)}:`+
+    `force_style='FontName=Noto Sans Devanagari,FontSize=24,PrimaryColour=&HFFFFFF,`+
+    `OutlineColour=&H000000,BorderStyle=3,Outline=2,Alignment=2'[outv]`);
+
+  args.push(
+    '-filter_complex', filters.join(';'),
+    '-map', '[outv]',
+    '-an',
+    '-c:v', 'libx264',
+    '-preset', 'medium',
+    '-crf', '23',
+    '-pix_fmt', 'yuv420p',
+    '-movflags', '+faststart',
+    outputPath,
+  );
+
+  try {
+    await execFileAsync('ffmpeg', args, { maxBuffer: 50 * 1024 * 1024 });
+  } catch (error: any) {
+    throw new Error(`Video rendering failed: ${error.stderr || error.message}`);
+  }
 }
 
-/**
- * Format seconds to SRT time format
- */
+async function writeSceneSubtitles(
+  scenes: any[],
+  fallbackScript: string,
+  durations: number[],
+  outputPath: string,
+): Promise<void> {
+  let cursor = 0;
+  const lines: string[] = [];
+  if (scenes.length > 0) {
+    scenes.slice(0, durations.length).forEach((scene, index) => {
+      const end = cursor + durations[index];
+      const text = String(scene.onScreenText || scene.voiceover || '').trim();
+      if (text) lines.push(`${index + 1}\n${formatSrtTime(cursor)} --> ${formatSrtTime(end)}\n${text}\n`);
+      cursor = end;
+    });
+  }
+  if (lines.length === 0) {
+    lines.push(`1\n${formatSrtTime(0)} --> ${formatSrtTime(durations.reduce((a, b) => a + b, 0))}\n${fallbackScript}\n`);
+  }
+  await fs.writeFile(outputPath, lines.join('\n'), 'utf8');
+}
+
+function mimeExtension(mimeType?: string): string {
+  if (mimeType === 'image/png') return 'png';
+  if (mimeType === 'image/webp') return 'webp';
+  return 'jpg';
+}
+
+function escapeFilterPath(filePath: string): string {
+  return filePath.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'");
+}
+
 function formatSrtTime(seconds: number): string {
   const hours = Math.floor(seconds / 3600);
   const minutes = Math.floor((seconds % 3600) / 60);
   const secs = Math.floor(seconds % 60);
   const millis = Math.floor((seconds % 1) * 1000);
-
-  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')},${String(millis).padStart(3, '0')}`;
+  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:`+
+    `${String(secs).padStart(2, '0')},${String(millis).padStart(3, '0')}`;
 }
 
-/**
- * Clean up temporary files
- */
-async function cleanupFiles(files: string[]): Promise<void> {
-  await Promise.all(
-    files.map(async (file) => {
-      try {
-        await fs.unlink(file);
-      } catch (e) {
-        // File might not exist, ignore
-      }
-    })
-  );
-}
-
-async function logAuditEvent(
-  contentItemId: string,
-  action: string,
-  metadata: Record<string, any>
-) {
+async function logAuditEvent(contentItemId: string, action: string, metadata: Record<string, unknown>) {
   await supabase.from('audit_logs').insert({
     content_item_id: contentItemId,
     action,

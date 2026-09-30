@@ -4,9 +4,10 @@
  */
 
 import { Job } from 'bullmq';
-import { supabase } from '@viralforge/supabase';
+import { requireSupabaseAdmin } from '@viralforge/supabase';
+
+const supabase = requireSupabaseAdmin();
 import { validatePayload, NicheId } from '@viralforge/domain';
-import { queueTextGeneration } from '../queues/content-queue';
 
 export async function researchWorker(job: Job) {
   // Handle legacy jobs where contentItemId might be in triggerMetadata
@@ -71,18 +72,8 @@ export async function researchWorker(job: Job) {
 
     await job.updateProgress(75);
 
-    const generationJob = await queueTextGeneration({
-      contentItemId,
-      nicheId: nicheId as NicheId,
-      dataInputPayload: {
-        ...dataInputPayload,
-        ...enrichedData,
-      },
-      triggerSource: job.data.triggerSource || 'manual',
-      triggerMetadata: { researchJobId: String(job.id) },
-      idempotencyKey: `generation-${contentItemId}`,
-    });
-
+    // Durable orchestration queues the successor only after this stage is
+    // checkpointed. This prevents a crash between DB update and queue.add().
     await job.updateProgress(90);
 
     const { data: contentItem } = await supabase
@@ -95,7 +86,7 @@ export async function researchWorker(job: Job) {
     await logAuditEvent(contentItem?.organization_id, contentItemId, 'research.completed', {
       nicheId,
       enrichedFields: Object.keys(enrichedData),
-      generationJobId: generationJob.id,
+      nextStage: 'generation',
     });
 
     await job.updateProgress(100);
@@ -106,7 +97,7 @@ export async function researchWorker(job: Job) {
       success: true,
       contentItemId,
       enrichedData,
-      generationJob,
+      nextStage: 'generation',
     };
   } catch (error) {
     console.error(`[Research] Error for content ${contentItemId}:`, error);

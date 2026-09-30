@@ -5,35 +5,61 @@
 
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
-const supabaseUrl = process.env.SUPABASE_URL || '';
-const supabaseAnonKey = process.env.SUPABASE_ANON_KEY || '';
-const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+const supabaseUrl = process.env.SUPABASE_URL?.trim();
+const supabaseAnonKey = process.env.SUPABASE_ANON_KEY?.trim();
+const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
 
-if (!supabaseUrl || !supabaseAnonKey) {
-  console.warn('Supabase credentials not fully configured');
+const serverAuthOptions = {
+  autoRefreshToken: false,
+  persistSession: false,
+  detectSessionInUrl: false,
+};
+
+let adminClient: SupabaseClient | null = null;
+let anonClient: SupabaseClient | null = null;
+
+/**
+ * Server processes use the service-role client because public application tables
+ * are protected by RLS. Never import this helper into browser code.
+ */
+export function requireSupabaseAdmin(): SupabaseClient {
+  if (!supabaseUrl) {
+    throw new Error('SUPABASE_URL is required for server database and storage access');
+  }
+  if (!supabaseServiceRoleKey) {
+    throw new Error('SUPABASE_SERVICE_ROLE_KEY is required for server database and storage access');
+  }
+  if (!adminClient) {
+    adminClient = createClient(supabaseUrl, supabaseServiceRoleKey, { auth: serverAuthOptions });
+  }
+  return adminClient;
 }
 
-// Client for user-facing operations (with anon key)
-export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
-  auth: {
-    autoRefreshToken: true,
-    persistSession: true,
-    detectSessionInUrl: true,
-  },
-});
+/**
+ * Explicit anon client for future user-facing/authenticated flows. Current API
+ * and worker code must use requireSupabaseAdmin().
+ */
+export function requireSupabaseAnon(): SupabaseClient {
+  if (!supabaseUrl) throw new Error('SUPABASE_URL is required for Supabase access');
+  if (!supabaseAnonKey) throw new Error('SUPABASE_ANON_KEY is required for anonymous Supabase access');
+  if (!anonClient) {
+    anonClient = createClient(supabaseUrl, supabaseAnonKey, { auth: serverAuthOptions });
+  }
+  return anonClient;
+}
 
-// Admin client for server-side operations (with service role key)
-export const supabaseAdmin = supabaseServiceRoleKey
-  ? createClient(supabaseUrl, supabaseServiceRoleKey, {
-      auth: {
-        autoRefreshToken: false,
-        persistSession: false,
-      },
-    })
+/** @deprecated Server code should call requireSupabaseAdmin() explicitly. */
+export const supabaseAdmin = supabaseUrl && supabaseServiceRoleKey
+  ? requireSupabaseAdmin()
   : null;
 
-// Storage client
-export const storage = supabase.storage;
+/** @deprecated Server code should call requireSupabaseAdmin() explicitly. */
+export const supabase = supabaseUrl && supabaseAnonKey
+  ? requireSupabaseAnon()
+  : null;
+
+/** @deprecated Use requireSupabaseAdmin().storage for private buckets. */
+export const storage = supabaseAdmin?.storage ?? null;
 
 // Database types for TypeScript
 export type Database = {

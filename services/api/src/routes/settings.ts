@@ -1,7 +1,9 @@
 import { Router } from 'express';
 import Redis from 'ioredis';
 import { asyncRoute } from './_helpers';
-import { supabase } from '@viralforge/supabase';
+import { requireSupabaseAdmin } from '@viralforge/supabase';
+
+const supabase = requireSupabaseAdmin();
 import { createOmnirouteAdapter } from '@viralforge/domain';
 
 const router = Router();

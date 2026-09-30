@@ -1,13 +1,18 @@
 {
   "extends": "../../tsconfig.json",
   "compilerOptions": {
-    "outDir": "./dist",
+    "rootDir": "src",
+    "outDir": "dist",
     "declaration": true,
     "declarationMap": true,
     "sourceMap": true,
     "composite": true,
-    "rootDir": "../.."
+    "tsBuildInfoFile": "dist/.tsbuildinfo"
   },
-  "include": ["src/**/*", "../../packages/*/index.ts", "../../packages/*/src/**/*"],
-  "exclude": ["node_modules", "dist"]
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist"],
+  "references": [
+    { "path": "../../packages/domain" },
+    { "path": "../../packages/supabase" }
+  ]
 }

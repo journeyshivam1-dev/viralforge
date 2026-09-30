@@ -1,0 +1,2 @@
+-- Intentionally empty. Local sample data is created through POST /api/dev/bootstrap
+-- so the same server-side validation path is used in development and tests.

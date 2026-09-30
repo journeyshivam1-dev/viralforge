@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { requireSupabaseAdmin } from '@viralforge/supabase';
 
 const supabase = requireSupabaseAdmin();
-import { createMetaOAuth } from '@viralforge/domain';
+import { createMetaOAuth, decryptSecret, encryptSecret } from '@viralforge/domain';
 import { asyncRoute, ensureDefaultOrganization, sendError } from './_helpers';
 
 const router = Router();
@@ -156,7 +156,10 @@ router.post('/accounts/meta/select', asyncRoute(async (req: Request, res: Respon
   );
   if (!selected) return sendError(res, 400, 'Selected Meta account was not discovered during OAuth');
 
-  const expiresAt = connection.expiresIn
+  // Page tokens derived from a long-lived user token do not expire; only a
+  // user-token fallback carries the user token's expiry.
+  const usesUserToken = selected.access_token === connection.accessToken;
+  const expiresAt = usesUserToken && connection.expiresIn
     ? new Date(Date.now() + connection.expiresIn * 1000).toISOString()
     : null;
 
@@ -167,8 +170,8 @@ router.post('/accounts/meta/select', asyncRoute(async (req: Request, res: Respon
     account_name: String(selected.account_name),
     account_id: parsed.data.account_id,
     account_type: parsed.data.platform === 'instagram' ? 'professional' : 'business',
-    // Token encryption is introduced with the production KMS migration. It stays server-only.
-    encrypted_access_token: selected.access_token,
+    // AES-256-GCM at rest (TOKEN_ENCRYPTION_KEY). Never returned to clients.
+    encrypted_access_token: encryptSecret(selected.access_token),
     token_expires_at: expiresAt,
     status: 'active',
     last_health_check: new Date().toISOString(),
@@ -181,7 +184,8 @@ router.post('/accounts/meta/select', asyncRoute(async (req: Request, res: Respon
   }, { onConflict: 'organization_id,niche_id,platform' }).select('*').single();
 
   if (error || !data) return sendError(res, 500, 'Failed to store connected Meta account', error?.message);
-  res.status(201).json({ ok: true, account: data });
+  const { encrypted_access_token: _token, encrypted_refresh_token: _refresh, ...account } = data;
+  res.status(201).json({ ok: true, account });
 }));
 
 router.post('/accounts/:id/health', asyncRoute(async (req, res) => {
@@ -195,7 +199,18 @@ router.post('/accounts/:id/health', asyncRoute(async (req, res) => {
   if (error || !account) return sendError(res, 404, 'Connected account not found', error?.message);
   if (account.metadata?.localDev) return sendError(res, 409, 'Local development accounts cannot be used for Meta health checks');
 
-  const response = await fetch(`https://graph.facebook.com/v21.0/${account.account_id}?fields=id,name,username&access_token=${encodeURIComponent(account.encrypted_access_token)}`);
+  let accessToken: string;
+  try {
+    accessToken = decryptSecret(account.encrypted_access_token);
+  } catch (decryptError) {
+    await supabase.from('connected_accounts').update({ status: 'expired', last_health_check: new Date().toISOString() }).eq('id', account.id);
+    return sendError(res, 409, (decryptError as Error).message);
+  }
+  const fields = account.platform === 'instagram' ? 'id,username' : 'id,name';
+  const response = await fetch(`https://graph.facebook.com/${process.env.META_GRAPH_VERSION || 'v23.0'}/${encodeURIComponent(account.account_id)}?fields=${fields}`, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+    signal: AbortSignal.timeout(15_000),
+  });
   const json = await response.json().catch(() => ({}));
   const body = json as { id?: string; name?: string; username?: string; error?: { message?: string } };
   const status = response.ok ? 'active' : 'expired';

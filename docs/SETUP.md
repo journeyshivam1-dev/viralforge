@@ -42,6 +42,20 @@ For Replicate-backed media generation, set `REPLICATE_API_TOKEN` and `REPLICATE_
 
 Keep `PUBLISHING_DISABLED=true` in local development. Meta cannot fetch media from local signed URLs.
 
+### Phase 2 keys (daily automation)
+
+| Variable | Needed for |
+|---|---|
+| `OMNIROUTE_API_KEY` | Primary text/image/TTS provider (`OMNIROUTE_BASE_URL=http://192.168.31.13:20128`). Set `OMNIROUTE_IMAGE_MODEL` / `OMNIROUTE_TTS_MODEL` to ids from `GET /v1/models`; leave empty to use Gemini for that capability. |
+| `GEMINI_API_KEY` | Fallback for every capability (Google AI Studio key). |
+| `YOUTUBE_API_KEY` | YouTube trending topics (optional; Google Trends RSS needs no key). |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USER_IDS`, `TELEGRAM_ALERT_CHAT_IDS` | One-tap approvals, bot commands, failure alerts. Get your numeric id from @userinfobot. Empty allowlist = nobody can act. |
+| `WHATSAPP_*` | Optional alert channel, see `docs/META_SETUP.md`. |
+| `TOKEN_ENCRYPTION_KEY`, `MEDIA_URL_SIGNING_SECRET` | Generate once (commands in `.env.example`); keep stable. |
+
+After adding keys restart `npm run dev`. The planner runs at 00:30 IST and every 30 minutes (idempotent);
+trigger it now from **Today's plan → Run planner now** or Telegram `/plan`.
+
 ## 4. Apply migrations
 
 ```bash
@@ -93,8 +107,10 @@ npm run build
 ```
 
 ```bash
-npm run supabase:test
+npm run test:db
 ```
+
+(`npm run supabase:test` also works where Docker can pull the `pg_prove` image.)
 
 ```bash
 npx supabase db lint --local --fail-on error

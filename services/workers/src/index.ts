@@ -13,6 +13,9 @@ import { validationWorker } from './jobs/validation';
 import { publishingWorker } from './jobs/publishing';
 import { schedulerWorker } from './jobs/scheduler';
 import { outboxDispatcherWorker, reconciliationWorker } from './jobs/outbox-dispatcher';
+import { notificationWorker } from './jobs/notifications';
+import { plannerWorker } from './jobs/planner';
+import { telegramPollWorker, telegramUpdateWorker } from './jobs/telegram-bot';
 import { withPipelineRuntime } from './pipeline/runtime';
 
 const workers = [
@@ -56,12 +59,26 @@ const workers = [
     if (job.name === 'pipeline-reconcile') return reconciliationWorker(job);
     return outboxDispatcherWorker(job);
   }, { concurrency: 1 }),
+
+  // Daily planner: topics + slots for every enabled niche.
+  createWorker(QUEUE_NAMES.PLANNER, plannerWorker, { concurrency: 1, lockDuration: 10 * 60_000 }),
+
+  // Telegram operator bot: long-poll (local) or webhook-enqueued updates (hosted).
+  createWorker(QUEUE_NAMES.TELEGRAM, async (job: Job) => (
+    job.name === 'telegram-update' ? telegramUpdateWorker(job) : telegramPollWorker(job)
+  ), { concurrency: 1 }),
+
+  // Operator alerts (Telegram / WhatsApp) from notification_outbox.
+  createWorker(QUEUE_NAMES.NOTIFICATIONS, notificationWorker, { concurrency: 1 }),
 ];
 
 async function ensureMaintenanceJobs() {
   const { getQueue } = await import('./queues/connection');
   const reconciliation = getQueue(QUEUE_NAMES.RECONCILIATION);
   const scheduler = getQueue(QUEUE_NAMES.SCHEDULER);
+  const notifications = getQueue(QUEUE_NAMES.NOTIFICATIONS);
+  const planner = getQueue(QUEUE_NAMES.PLANNER);
+  const telegram = getQueue(QUEUE_NAMES.TELEGRAM);
   await reconciliation.upsertJobScheduler('outbox-dispatcher', { every: 5_000 }, {
     name: 'outbox-dispatch', data: {}, opts: { removeOnComplete: 20, removeOnFail: 100 },
   });
@@ -70,6 +87,23 @@ async function ensureMaintenanceJobs() {
   });
   await scheduler.upsertJobScheduler('content-scheduler', { every: 60_000 }, {
     name: 'schedule-content', data: {}, opts: { removeOnComplete: 20, removeOnFail: 100 },
+  });
+  // Main run just after midnight IST; the 30-minute tick catches up if the
+  // machine was off, and plans tomorrow after 20:00 IST. Both are idempotent.
+  await planner.upsertJobScheduler('daily-planner', { pattern: '30 0 * * *', tz: 'Asia/Kolkata' }, {
+    name: 'plan-day', data: {}, opts: { attempts: 4, backoff: { type: 'exponential', delay: 60_000 }, removeOnComplete: 50, removeOnFail: 100 },
+  });
+  await planner.upsertJobScheduler('planner-catch-up', { every: 30 * 60_000 }, {
+    name: 'plan-day', data: {}, opts: { attempts: 1, removeOnComplete: 50, removeOnFail: 100 },
+  });
+  if ((process.env.TELEGRAM_MODE || 'polling') === 'polling' && process.env.TELEGRAM_BOT_TOKEN) {
+    // Each poll long-waits up to 20s, so a 2s cadence gives near-instant replies.
+    await telegram.upsertJobScheduler('telegram-poller', { every: 2_000 }, {
+      name: 'telegram-poll', data: {}, opts: { removeOnComplete: 10, removeOnFail: 50 },
+    });
+  }
+  await notifications.upsertJobScheduler('notification-dispatcher', { every: 10_000 }, {
+    name: 'dispatch-notifications', data: {}, opts: { removeOnComplete: 20, removeOnFail: 100 },
   });
 }
 

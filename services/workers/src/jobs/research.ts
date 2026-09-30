@@ -1,256 +1,127 @@
 /**
  * Research Worker
- * Collects and validates content input data
+ * Produces grounded research notes for a content item via the AI provider chain
+ * (Omniroute, then Gemini). Notes are checkpointed on the content row and reused
+ * on retry, so a later-stage retry never re-runs research.
  */
 
 import { Job } from 'bullmq';
 import { requireSupabaseAdmin } from '@viralforge/supabase';
+import {
+  NicheId,
+  ResearchNotesSchema,
+  UNTRUSTED_DATA_RULE,
+  asDataBlock,
+  createAiProviderChainFromEnv,
+  getNichePlaybook,
+  parseJsonObject,
+  readBrief,
+  sanitizePromptList,
+  sanitizePromptText,
+  validatePayload,
+  type ResearchNotes,
+} from '@viralforge/domain';
 
 const supabase = requireSupabaseAdmin();
-import { validatePayload, NicheId } from '@viralforge/domain';
+const aiChain = createAiProviderChainFromEnv();
 
 export async function researchWorker(job: Job) {
-  // Handle legacy jobs where contentItemId might be in triggerMetadata
-  const { contentItemId: topLevelContentItemId, nicheId: topLevelNicheId, dataInputPayload: topLevelDataInputPayload, triggerMetadata } = job.data;
-  const contentItemId = topLevelContentItemId || triggerMetadata?.contentItemId;
-  const nicheId = topLevelNicheId || triggerMetadata?.nicheId;
-  const dataInputPayload = topLevelDataInputPayload || triggerMetadata?.dataInputPayload || {};
+  const contentItemId = job.data?.contentItemId || job.data?.triggerMetadata?.contentItemId;
+  if (!contentItemId) throw new Error('contentItemId is required in job.data');
 
-  if (!contentItemId) {
-    throw new Error('contentItemId is required in job.data or job.data.triggerMetadata');
+  const { data: item, error } = await supabase
+    .from('content_items')
+    .select('id, organization_id, niche_id, sub_topic, media_type, data_input_payload')
+    .eq('id', contentItemId)
+    .single();
+  if (error || !item) throw Object.assign(new Error(`Content item not found: ${contentItemId}`), { code: 'NOT_FOUND' });
+
+  const payload = (item.data_input_payload || {}) as Record<string, any>;
+  const existing = ResearchNotesSchema.safeParse(payload.research);
+  if (existing.success) {
+    return { success: true, contentItemId, reused: true, nextStage: 'generation' };
   }
 
-  // Log warning if we had to fall back to triggerMetadata
-  if (topLevelContentItemId !== contentItemId || topLevelNicheId !== nicheId) {
-    console.warn(`[Research] Using fallback values from triggerMetadata for content ${contentItemId}`);
-  }
-
-  console.log(`[Research] Starting research for content ${contentItemId}`);
-
-  try {
-    // Update job progress
-    await job.updateProgress(10);
-
-    // Validate payload for niche
-    const validationErrors = validatePayload(nicheId as NicheId, dataInputPayload || {});
-
+  const brief = readBrief(payload);
+  if (!brief) {
+    // Legacy hand-made items must carry their niche-specific fields.
+    const validationErrors = validatePayload(item.niche_id as NicheId, payload);
     if (validationErrors.length > 0) {
-      // Update content item with validation errors
-      await supabase
-        .from('content_items')
-        .update({
-          status: 'blocked',
-          validation_errors: validationErrors,
-        })
-        .eq('id', contentItemId);
-
-      throw new Error(`Validation failed: ${validationErrors.join(', ')}`);
+      return { success: false, blocked: true, code: 'INVALID_INPUT', reason: validationErrors.join('; ') };
     }
-
-    await job.updateProgress(30);
-
-    // Enrich data with additional research (placeholder for actual research logic)
-    const enrichedData = await performResearch(nicheId as NicheId, dataInputPayload || {});
-
-    await job.updateProgress(60);
-
-    // Update content item with researched data
-    const { error: updateError } = await supabase
-      .from('content_items')
-      .update({
-        status: 'researched',
-        data_input_payload: {
-          ...dataInputPayload,
-          ...enrichedData,
-        },
-      })
-      .eq('id', contentItemId);
-
-    if (updateError) {
-      throw new Error(`Failed to update content item: ${updateError.message}`);
-    }
-
-    await job.updateProgress(75);
-
-    // Durable orchestration queues the successor only after this stage is
-    // checkpointed. This prevents a crash between DB update and queue.add().
-    await job.updateProgress(90);
-
-    const { data: contentItem } = await supabase
-      .from('content_items')
-      .select('organization_id')
-      .eq('id', contentItemId)
-      .single();
-
-    // Log audit event
-    await logAuditEvent(contentItem?.organization_id, contentItemId, 'research.completed', {
-      nicheId,
-      enrichedFields: Object.keys(enrichedData),
-      nextStage: 'generation',
-    });
-
-    await job.updateProgress(100);
-
-    console.log(`[Research] Research completed for content ${contentItemId}`);
-
-    return {
-      success: true,
-      contentItemId,
-      enrichedData,
-      nextStage: 'generation',
-    };
-  } catch (error) {
-    console.error(`[Research] Error for content ${contentItemId}:`, error);
-
-    // Update content item status
-    await supabase
-      .from('content_items')
-      .update({
-        status: 'failed',
-        validation_errors: [error instanceof Error ? error.message : String(error)],
-      })
-      .eq('id', contentItemId);
-
-    throw error;
   }
-}
 
-/**
- * Perform niche-specific research
- * This would connect to external APIs, databases, etc.
- */
-async function performResearch(
-  nicheId: NicheId,
-  payload: Record<string, any>
-): Promise<Record<string, any>> {
-  switch (nicheId) {
-    case 'food':
-      return {
-        regionalVariations: await getRegionalVariations(payload.dish),
-        cookingTips: await getCookingTips(payload.dish),
-        nutritionalInfo: await getNutritionalInfo(payload.dish),
-      };
+  await job.updateProgress(20);
+  const playbook = getNichePlaybook(item.niche_id);
+  const topic = sanitizePromptText(brief?.title || item.sub_topic, 200);
+  const context = brief
+    ? [
+        `Angle: ${sanitizePromptText(brief.angle, 500)}`,
+        `Key points: ${sanitizePromptList(brief.keyPoints).join('; ') || '-'}`,
+        `Trend context: ${sanitizePromptText(brief.trendContext, 1000) || '-'}`,
+      ].join('\n')
+    : `Operator input: ${sanitizePromptText(JSON.stringify(stripInternal(payload)), 2000)}`;
 
-    case 'health':
-      return {
-        healthBenefits: await getHealthBenefits(payload.transformedDish),
-        calorieInfo: await getCalorieInfo(payload.originalDish, payload.transformedDish),
-        proteinInfo: await getProteinInfo(payload.transformedDish),
-      };
+  const result = await aiChain.generateText({
+    json: true,
+    temperature: 0.4,
+    maxTokens: 2000,
+    system: `You are a careful research assistant for a Hindi/Hinglish ${playbook?.displayName || item.niche_id} social media channel. `
+      + 'Only state facts you are confident are true. If unsure, leave it out. Return JSON only. '
+      + UNTRUSTED_DATA_RULE,
+    user: [
+      asDataBlock('topic', `Topic: ${topic}\n${context}`),
+      `Audience: ${playbook?.audience || 'Hindi-speaking Indian viewers'}`,
+      `Safety rules: ${(playbook?.safetyRules || []).join('; ') || '-'}`,
+      '',
+      'Return exactly: {"summary": "string", "facts": ["string"], "audiencePainPoints": ["string"], "hookIdeas": ["string"], "cautions": ["string"]}',
+      'facts: 3-8 short verifiable facts. hookIdeas: 3-5 scroll-stopping Hinglish hooks. cautions: anything the writer must not claim.',
+    ].join('\n'),
+  });
 
-    case 'tech':
-      return {
-        toolAlternatives: await getToolAlternatives(payload.toolName),
-        pricingInfo: await getPricingInfo(payload.toolName),
-        useCases: await getUseCases(payload.toolName),
-      };
+  await job.updateProgress(70);
+  const raw = parseJsonObject(result.text);
+  const notes: ResearchNotes = ResearchNotesSchema.parse({
+    schemaVersion: 1,
+    summary: String(raw.summary || '').slice(0, 1500),
+    facts: stringArray(raw.facts, 12, 400),
+    audiencePainPoints: stringArray(raw.audiencePainPoints, 8, 300),
+    hookIdeas: stringArray(raw.hookIdeas, 8, 200),
+    cautions: stringArray(raw.cautions, 8, 300),
+    provider: result.provider,
+    model: result.model,
+    researchedAt: new Date().toISOString(),
+  });
 
-    case 'edtech':
-      return {
-        examPattern: await getExamPattern(payload.exam, payload.subject),
-        previousYearQuestions: await getPYQs(payload.exam, payload.subject, payload.topic),
-        preparationTips: await getPrepTips(payload.exam, payload.subject),
-      };
+  const { error: updateError } = await supabase
+    .from('content_items')
+    .update({ status: 'researched', data_input_payload: { ...payload, research: notes } })
+    .eq('id', contentItemId);
+  if (updateError) throw new Error(`Failed to save research notes: ${updateError.message}`);
 
-    case 'travel':
-      return {
-        weatherInfo: await getWeatherInfo(payload.location),
-        localAttractions: await getLocalAttractions(payload.location),
-        budgetTips: await getBudgetTips(payload.location),
-      };
-
-    case 'cartoon':
-      return {
-        culturalContext: await getCulturalContext(payload.dialect),
-        characterSuggestions: await getCharacterSuggestions(payload.theme),
-      };
-
-    default:
-      return {};
-  }
-}
-
-// Placeholder research functions - implement with actual APIs
-async function getRegionalVariations(dish: string) {
-  return [`${dish} - Punjabi style`, `${dish} - South Indian style`, `${dish} - Bengali style`];
-}
-
-async function getCookingTips(dish: string) {
-  return ['Use fresh ingredients', 'Control flame for perfect texture', 'Add tempering at the end'];
-}
-
-async function getNutritionalInfo(dish: string) {
-  return { calories: '~200 per serving', protein: '~8g', carbs: '~25g', fat: '~8g' };
-}
-
-async function getHealthBenefits(dish: string) {
-  return ['Rich in protein', 'Low glycemic index', 'Good for gut health'];
-}
-
-async function getCalorieInfo(original: string, transformed: string) {
-  return { original: 450, transformed: 280, saved: 170 };
-}
-
-async function getProteinInfo(dish: string) {
-  return { perServing: '18g', dailyValue: '36%' };
-}
-
-async function getToolAlternatives(tool: string) {
-  return [`Alternative 1 to ${tool}`, `Alternative 2 to ${tool}`];
-}
-
-async function getPricingInfo(tool: string) {
-  return { free: true, premium: '$9/month' };
-}
-
-async function getUseCases(tool: string) {
-  return ['Automation', 'Productivity', 'Time saving'];
-}
-
-async function getExamPattern(exam: string, subject: string) {
-  return { totalMarks: 100, sections: 4, duration: '3 hours' };
-}
-
-async function getPYQs(exam: string, subject: string, topic: string) {
-  return [`2023 - ${topic} question`, `2022 - ${topic} question`];
-}
-
-async function getPrepTips(exam: string, subject: string) {
-  return ['Focus on concepts', 'Practice daily', 'Take mock tests'];
-}
-
-async function getWeatherInfo(location: string) {
-  return { current: '25°C', best: 'October-March' };
-}
-
-async function getLocalAttractions(location: string) {
-  return [`${location} Fort`, `${location} Temple`, `${location} Beach`];
-}
-
-async function getBudgetTips(location: string) {
-  return ['Stay in hostels', 'Use local transport', 'Eat at local joints'];
-}
-
-async function getCulturalContext(dialect: string) {
-  return { region: 'North India', style: 'Family comedy' };
-}
-
-async function getCharacterSuggestions(theme: string) {
-  return ['Character A', 'Character B', 'Supporting cast'];
-}
-
-async function logAuditEvent(
-  organizationId: string | undefined,
-  contentItemId: string,
-  action: string,
-  metadata: Record<string, any>
-) {
   await supabase.from('audit_logs').insert({
-    organization_id: organizationId,
+    organization_id: item.organization_id,
     content_item_id: contentItemId,
-    action,
+    niche_id: item.niche_id,
+    action: 'research.completed',
     actor: 'system',
     actor_type: 'system',
-    metadata,
+    metadata: { provider: result.provider, model: result.model, factCount: notes.facts.length, fallbacks: result.fallbackAttempts },
   });
+
+  await job.updateProgress(100);
+  return { success: true, contentItemId, provider: result.provider, factCount: notes.facts.length, nextStage: 'generation' };
+}
+
+function stringArray(value: unknown, maxItems: number, maxLength: number): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0)
+    .map((entry) => entry.trim().slice(0, maxLength))
+    .slice(0, maxItems);
+}
+
+function stripInternal(payload: Record<string, any>): Record<string, any> {
+  const { research: _research, brief: _brief, ...rest } = payload;
+  return rest;
 }

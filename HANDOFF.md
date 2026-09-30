@@ -9,6 +9,40 @@ This file is the source of truth for what exists, what Phase 1 shipped, what is 
 
 ---
 
+## Phase 2 status (2026-09-30) — read this first
+
+Plan and operator decisions: `docs/PHASE2_PLAN.md`. Meta/WhatsApp/tunnel setup: `docs/META_SETUP.md`.
+Target: 5 niches (cartoon, food, health, tech, edtech) × 5 posts/day (3 reels, 1 carousel, 1 image) → IG + FB, IST slots,
+one-tap approval by default (fully automatic per niche), zero-touch otherwise.
+
+**Shipped in code, verified locally:**
+
+| Slice | What | Where |
+|---|---|---|
+| S1 | 4 attempts + exponential backoff; `retry_failed_pipelines` resumes only the failed stage; scheduler never restarts a run from research; Telegram + WhatsApp alerts on permanent failure / block via `notification_outbox` trigger | `supabase/migrations/20260930000100_*`, `jobs/scheduler.ts`, `jobs/notifications.ts` |
+| S2 | `AiProviderChain`: Omniroute → Gemini → Replicate(images). Text, image, TTS, video (async poll for the timing-out Omniroute video endpoint). Real LLM research replaced the hardcoded placeholder "facts". Prompt data sanitized + fenced as `<data>` | `packages/domain/src/adapters/ai-providers.ts`, `jobs/research.ts`, `jobs/generation.ts` |
+| S3 | Daily planner (00:30 IST cron + 30-min catch-up, plans tomorrow after 20:00 IST): IST slots with deterministic jitter, operator backlog/calendar first, then LLM ideation over Google Trends RSS + YouTube mostPopular, 60-day de-dup | `packages/domain/src/planner.ts`, `adapters/trends.ts`, `jobs/planner.ts`, migration `…000200_*` |
+| S4 | Media per type: scene images (9:16 reels, 4:5 posts) + per-scene Hindi TTS, checkpointed per artifact. Rendering: Ken Burns + voiceover-fitted scene length + libass captions (`ass` filter, `shaping=complex` — the `subtitles` filter mis-places Devanagari matras); 1080×1350 slides | `jobs/media.ts`, `render/compose.ts`, `jobs/rendering.ts`, `jobs/validation.ts` |
+| S5 | New Graph client (tokens in headers only): IG image/carousel/reel, FB photo/multi-photo/reel (old FB reel code never uploaded the file). Fan-out to every active account of the niche via `publication_attempts`; IG container saved before publish → no double posts; AES-256-GCM token encryption; HMAC-signed public media edge on its own port | `adapters/meta-graph.ts`, `jobs/publishing.ts`, `security/*`, `services/api/src/media-edge.ts` |
+| S6 | `approve_pipeline_run` / `reject_pipeline_run` / `auto_approve_due_runs`; resume respects `scheduled_at` (early approval still posts at the slot); Telegram bot (long-polling by default) with preview + Approve/Reject buttons, `/today /pending /retryfailed /plan /topic` | migration `…000200_*`, `jobs/telegram-bot.ts` |
+| S7 | Dashboard: **Today's plan**, **Automation** (niche settings + topic CSV import), Approve/Reject on content page, Retry-all on queue monitor | `services/dashboard/src/pages/today.tsx`, `automation.tsx` |
+
+**Security fixes made along the way:** Telegram webhook verified a signature Telegram never sends and failed open with an
+empty allowlist; `setWebhook` used the bot token as `secret_token`; WhatsApp webhook HMAC used the verify token over
+re-serialized JSON, only in production, and failed open; Meta tokens were stored in plaintext and sent in query strings.
+
+**Checks (this machine):** `npm test -- --runInBand` 37/37 · `npm run test:db` 38/38 · `npx supabase db lint --local --fail-on error` pass (2 known warnings) · build all workspaces.
+Use `npm run test:db` instead of `supabase test db` on low-memory Docker hosts — pulling the `pg_prove` image hung Docker Desktop here.
+Supabase `[analytics]` is disabled in `config.toml` for the same reason (vector crash-looped).
+
+**Not yet verified end to end (needs operator keys in `.env`):** `OMNIROUTE_API_KEY` (+ `OMNIROUTE_IMAGE_MODEL` / `OMNIROUTE_TTS_MODEL` once
+their model ids are known from `/v1/models`), `GEMINI_API_KEY`, `YOUTUBE_API_KEY`, `TELEGRAM_BOT_TOKEN` + `TELEGRAM_ALLOWED_USER_IDS` +
+`TELEGRAM_ALERT_CHAT_IDS`. Without them the planner fails cleanly with "No provider is configured for text" and retries every 30 min.
+
+**Next:** live run with keys → tune prompts per niche → tunnel + `PUBLISHING_DISABLED=false` for one niche → insights-driven slot tuning.
+
+---
+
 ## What this project is
 
 ViralForge is a **Hindi / Hinglish Instagram + Facebook content automation platform**.

@@ -68,12 +68,17 @@ export const QUEUE_NAMES_BY_STAGE: Record<PipelineStage, string> = {
   publishing: 'viralforge-publishing',
 };
 
+/**
+ * Four attempts with exponential backoff (delay, 2x, 4x). Must match
+ * pipeline_max_attempts() in SQL. Provider outages are the common failure, so
+ * media gets the longest base delay (1m, 2m, 4m).
+ */
 export const STAGE_RETRY_POLICY: Record<PipelineStage, { attempts: number; backoffMs: number }> = {
-  research: { attempts: 3, backoffMs: 2_000 },
-  generation: { attempts: 3, backoffMs: 5_000 },
-  media: { attempts: 3, backoffMs: 10_000 },
-  rendering: { attempts: 2, backoffMs: 10_000 },
-  validation: { attempts: 2, backoffMs: 2_000 },
+  research: { attempts: 4, backoffMs: 10_000 },
+  generation: { attempts: 4, backoffMs: 30_000 },
+  media: { attempts: 4, backoffMs: 60_000 },
+  rendering: { attempts: 4, backoffMs: 15_000 },
+  validation: { attempts: 4, backoffMs: 5_000 },
   // Remote publishing is reconciled before a new logical attempt is created.
   publishing: { attempts: 1, backoffMs: 0 },
 };

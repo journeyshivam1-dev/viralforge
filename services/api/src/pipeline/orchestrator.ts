@@ -70,43 +70,38 @@ export async function retryPipelineFromStage(runId: string, stage: unknown, requ
   return { runId, stage, stageAttemptId: attemptId };
 }
 
-export async function approveContent(runId: string, requestedBy: string) {
+/**
+ * Resumes every failed/blocked run in the organization from its failed stage.
+ * Completed stages are not re-run; their outputs stay on the content row.
+ */
+export async function retryFailedPipelines(organizationId: string, requestedBy: string, limit = 100) {
   const admin = requireSupabaseAdmin();
-  const { data: run, error: runError } = await admin.from('pipeline_runs').select('content_item_id').eq('id', runId).single();
-  if (runError || !run) throw new Error(`Pipeline run not found: ${runError?.message || runId}`);
-
-  const { error: approvalError } = await admin.from('content_items').update({
-    approval_status: 'approved',
-    approved_at: new Date().toISOString(),
-    approved_by: requestedBy,
-  }).eq('id', run.content_item_id);
-  if (approvalError) throw new Error(`Failed to approve content: ${approvalError.message}`);
-
-  const { data: attemptId, error } = await admin.rpc('resume_pipeline_run', {
-    p_run_id: runId,
+  const { data, error } = await admin.rpc('retry_failed_pipelines', {
+    p_organization_id: organizationId,
     p_requested_by: requestedBy,
+    p_limit: limit,
   });
-  if (error) throw new Error(`Failed to resume pipeline after approval: ${error.message}`);
+  if (error) throw new Error(`Failed to retry failed pipelines: ${error.message}`);
+  return data as { retriedCount: number; skippedCount: number; retried: unknown[]; skipped: unknown[] };
+}
+
+export async function approveContent(runId: string, approvedBy: string) {
+  const admin = requireSupabaseAdmin();
+  const { data: attemptId, error } = await admin.rpc('approve_pipeline_run', {
+    p_run_id: runId,
+    p_approved_by: approvedBy,
+  });
+  if (error) throw new Error(`Failed to approve content: ${error.message}`);
   return { runId, stageAttemptId: attemptId };
 }
 
-export async function rejectContent(runId: string, reason: string) {
+export async function rejectContent(runId: string, reason: string, rejectedBy = 'dashboard') {
   const admin = requireSupabaseAdmin();
-  const { data: run, error: runError } = await admin.from('pipeline_runs').select('content_item_id').eq('id', runId).single();
-  if (runError || !run) throw new Error(`Pipeline run not found: ${runError?.message || runId}`);
-
-  const { error: rejectionError } = await admin.from('content_items').update({
-    approval_status: 'rejected',
-    validation_errors: [reason],
-  }).eq('id', run.content_item_id);
-  if (rejectionError) throw new Error(`Failed to reject content: ${rejectionError.message}`);
-
-  const { error: cancelError } = await admin.from('pipeline_runs').update({
-    status: 'cancelled',
-    error: { code: 'rejected_by_operator', message: reason },
-    cancelled_at: new Date().toISOString(),
-  }).eq('id', runId);
-  if (cancelError) throw new Error(`Failed to cancel pipeline run: ${cancelError.message}`);
-
+  const { error } = await admin.rpc('reject_pipeline_run', {
+    p_run_id: runId,
+    p_rejected_by: rejectedBy,
+    p_reason: reason,
+  });
+  if (error) throw new Error(`Failed to reject content: ${error.message}`);
   return { runId };
 }

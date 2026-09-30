@@ -39,6 +39,9 @@ export const QUEUE_NAMES = {
   PUBLISHING: 'viralforge-publishing',
   RECONCILIATION: 'viralforge-reconciliation',
   SCHEDULER: 'viralforge-scheduler',
+  NOTIFICATIONS: 'viralforge-notifications',
+  PLANNER: 'viralforge-planner',
+  TELEGRAM: 'viralforge-telegram',
 } as const;
 
 // Queue instances (singleton per name)

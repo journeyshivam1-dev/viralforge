@@ -385,7 +385,9 @@ deno_version = 2
 # secret_key = "env(SECRET_VALUE)"
 
 [analytics]
-enabled = true
+# Disabled locally: the log pipeline (vector + logflare) adds ~1GB RAM and only
+# powers Studio's log explorer. Enable when you need it.
+enabled = false
 port = 54327
 # Configure one of the supported backends: `postgres`, `bigquery`.
 backend = "postgres"

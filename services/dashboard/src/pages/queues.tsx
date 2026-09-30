@@ -19,6 +19,16 @@ export default function QueuesPage() {
     setBusy(true);
     try { await api(`/api/queues/${queue}/jobs/${id}`, { method: 'DELETE' }); load(); } catch (e: any) { setError(e.message); } finally { setBusy(false); }
   };
+  const [notice, setNotice] = useState('');
+  const retryAllFailed = async () => {
+    if (!confirm('Resume every failed or blocked pipeline from its failed stage? Completed stages are kept.')) return;
+    setBusy(true);
+    try {
+      const result = await api<{ message: string; skippedCount: number }>('/api/pipeline-runs/retry-failed', { method: 'POST', body: JSON.stringify({}) });
+      setNotice(result.skippedCount ? `${result.message} (${result.skippedCount} skipped)` : result.message);
+      load();
+    } catch (e: any) { setError(e.message); } finally { setBusy(false); }
+  };
   const openJob = async (queue: string, id: string) => {
     try {
       const result = await api<{ job: JobDetail }>(`/api/queues/${queue}/jobs/${id}`);
@@ -37,9 +47,13 @@ export default function QueuesPage() {
     <>
       <div className="page-header">
         <div><h2>Queue monitor</h2><p>Watch the content pipeline as jobs move from research to publishing.</p></div>
-        <button className="button secondary" onClick={load} disabled={busy}>↻ Refresh</button>
+        <div>
+          <button className="button primary" onClick={retryAllFailed} disabled={busy}>Retry all failed pipelines</button>
+          <button className="button secondary" onClick={load} disabled={busy}>↻ Refresh</button>
+        </div>
       </div>
       {error && <div className="notice warning">{error}</div>}
+      {notice && <div className="notice">{notice}</div>}
       <div className="grid three">
         {queues.map((queue) => {
           const active = Number(queue.counts?.active || 0);

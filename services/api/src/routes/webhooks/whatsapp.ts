@@ -31,39 +31,26 @@ router.get('/whatsapp', (req: Request, res: Response) => {
 });
 
 /**
- * Verify WhatsApp message signature
- * WhatsApp signs payloads with HMAC-SHA256
+ * Verify Meta's X-Hub-Signature-256 header: "sha256=" + HMAC-SHA256 of the raw
+ * request body keyed with the Meta App Secret (not the verify token).
  */
 export function verifyWhatsAppSignature(
-  body: string,
-  signature: string | undefined
+  rawBody: Buffer | undefined,
+  signature: string | undefined,
+  appSecret: string | undefined = process.env.META_APP_SECRET,
 ): boolean {
-  if (!signature || !WHATSAPP_VERIFY_TOKEN) return false;
-
-  const expectedSignature = crypto
-    .createHmac('sha256', WHATSAPP_VERIFY_TOKEN)
-    .update(body)
-    .digest('hex');
-
-  return crypto.timingSafeEqual(
-    Buffer.from(signature),
-    Buffer.from(expectedSignature)
-  );
+  if (!rawBody || !signature || !appSecret || !signature.startsWith('sha256=')) return false;
+  const expected = Buffer.from(`sha256=${crypto.createHmac('sha256', appSecret).update(rawBody).digest('hex')}`);
+  const given = Buffer.from(signature);
+  return given.length === expected.length && crypto.timingSafeEqual(given, expected);
 }
 
 /**
- * Check if phone number is authorized
+ * Exact-match allowlist. An empty allowlist denies everyone (fail closed).
  */
 export function isPhoneAuthorized(phone: string): boolean {
-  // Normalize phone number
   const normalized = phone.replace(/\D/g, '');
-
-  // If no allowlist configured, allow all (development mode)
-  if (AUTHORIZED_PHONES.length === 0) return true;
-
-  return AUTHORIZED_PHONES.some(allowed =>
-    normalized.includes(allowed.replace(/\D/g, ''))
-  );
+  return normalized.length > 0 && AUTHORIZED_PHONES.some((allowed) => allowed.replace(/\D/g, '') === normalized);
 }
 
 /**
@@ -128,14 +115,11 @@ async function sendWhatsAppMessage(to: string, text: string): Promise<boolean> {
  */
 router.post('/whatsapp', async (req: Request, res: Response) => {
   try {
-    // Verify signature in production
-    if (process.env.NODE_ENV === 'production') {
-      const signature = req.headers['x-hub-signature-256'] as string;
-      const bodyStr = JSON.stringify(req.body);
-
-      if (!verifyWhatsAppSignature(bodyStr, signature)) {
-        return res.status(401).json({ error: 'Invalid signature' });
-      }
+    // Always verify: unsigned requests are rejected in every environment.
+    const signature = req.headers['x-hub-signature-256'] as string | undefined;
+    if (!verifyWhatsAppSignature((req as Request & { rawBody?: Buffer }).rawBody, signature)) {
+      console.warn(`[WhatsApp] Rejected webhook with invalid signature from ${req.ip}`);
+      return res.status(401).json({ error: 'Invalid signature' });
     }
 
     // Respond quickly to WhatsApp (must be within 20 seconds)

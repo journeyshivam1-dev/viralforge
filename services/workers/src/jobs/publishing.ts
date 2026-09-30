@@ -1,226 +1,250 @@
 /**
  * Publishing Worker
- * Publishes validated content to Meta platforms (Instagram/Facebook)
+ * Publishes a validated item to every active Instagram and Facebook account of
+ * its niche. One publication_attempts row per account makes this idempotent:
+ * - accounts already published are skipped on retry,
+ * - an IG container id is stored before media_publish, so a crash resumes that
+ *   container instead of creating a second post,
+ * - a timeout on the final publish call is recorded as `uncertain` and alerted
+ *   instead of being retried blindly (it may have gone live).
+ * PUBLISHING_DISABLED (default true) is checked first and always wins.
  */
 
 import { Job } from 'bullmq';
 import { requireSupabaseAdmin } from '@viralforge/supabase';
+import {
+  MediaProviderError,
+  MetaGraphClient,
+  RenderManifestSchema,
+  TokenCryptoError,
+  decryptSecret,
+  signMediaPath,
+  storagePathFromUrl,
+  type MediaType,
+  type PublishOutcome,
+} from '@viralforge/domain';
+import { composeCaption } from './validation';
 
 const supabase = requireSupabaseAdmin();
-const storage = supabase.storage;
-import { createInstagramPublisher, createFacebookPublisher } from '@viralforge/domain';
+const MEDIA_URL_TTL_SECONDS = 2 * 60 * 60;
+
+interface Account {
+  id: string;
+  platform: 'instagram' | 'facebook';
+  account_id: string;
+  account_name: string;
+  encrypted_access_token: string;
+  status: string;
+}
+
+interface Publication {
+  accountId: string;
+  platform: string;
+  status: 'published' | 'failed' | 'uncertain' | 'skipped';
+  remoteId?: string;
+  permalink?: string;
+  error?: string;
+  classification?: string;
+}
 
 export async function publishingWorker(job: Job) {
-  const { contentItemId } = job.data;
+  const { contentItemId, runId, stageAttemptId } = job.data as { contentItemId: string; runId?: string; stageAttemptId?: string };
 
-  console.log(`[Publishing] Starting publishing for content ${contentItemId}`);
+  if (process.env.PUBLISHING_DISABLED !== 'false') {
+    return { success: false, blocked: true, code: 'PUBLISHING_DISABLED', reason: 'Publishing is disabled (PUBLISHING_DISABLED); package is ready and waiting' };
+  }
+  if (!runId || !stageAttemptId) throw Object.assign(new Error('Publishing requires a durable pipeline attempt'), { code: 'INVALID_INPUT' });
 
+  const { data: item, error } = await supabase.from('content_items').select('*').eq('id', contentItemId).single();
+  if (error || !item) throw Object.assign(new Error(`Content item not found: ${contentItemId}`), { code: 'NOT_FOUND' });
+  if (!['validated', 'scheduled', 'publishing'].includes(item.status)) {
+    throw Object.assign(new Error(`Cannot publish content in status ${item.status}`), { code: 'INVALID_INPUT' });
+  }
+  if (item.publish_mode === 'manual_approval' && item.approval_status !== 'approved') {
+    return { success: false, blocked: true, code: 'APPROVAL_REQUIRED', reason: 'Content is not approved for publishing' };
+  }
+
+  const { data: accounts, error: accountError } = await supabase
+    .from('connected_accounts')
+    .select('id, platform, account_id, account_name, encrypted_access_token, status')
+    .eq('organization_id', item.organization_id)
+    .eq('niche_id', item.niche_id)
+    .eq('status', 'active');
+  if (accountError) throw new Error(`Failed to load accounts: ${accountError.message}`);
+  if (!accounts?.length) {
+    return { success: false, blocked: true, code: 'NO_ACCOUNTS', reason: `No active Instagram/Facebook account connected for ${item.niche_id}` };
+  }
+
+  const render = RenderManifestSchema.safeParse(stripRenderExtras(item.rendering_manifest));
+  if (!render.success) return { success: false, blocked: true, code: 'RENDER_MISSING', reason: 'Rendering manifest is missing; retry from rendering' };
+
+  let mediaUrls: string[];
   try {
-    // Check global kill switch
-    if (process.env.PUBLISHING_DISABLED !== 'false') {
-      console.warn('[Publishing] Publishing disabled; package remains ready for approval');
-      return {
-        success: false,
-        blocked: true,
-        code: 'PUBLISHING_DISABLED',
-        reason: 'Publishing is disabled; generated package is ready for approval',
-      };
-    }
-
-    await job.updateProgress(10);
-
-    // Get content item
-    const { data: contentItem, error: fetchError } = await supabase
-      .from('content_items')
-      .select('*, connected_accounts!content_items_niche_account_id_fkey(*)')
-      .eq('id', contentItemId)
-      .single();
-
-    if (fetchError || !contentItem) {
-      throw new Error(`Content item not found: ${contentItemId}`);
-    }
-
-    if (contentItem.status !== 'scheduled' && contentItem.status !== 'validated') {
-      throw new Error(`Cannot publish content in status: ${contentItem.status}`);
-    }
-
-    await job.updateProgress(20);
-
-    // Update status to publishing
-    await supabase
-      .from('content_items')
-      .update({ status: 'publishing' })
-      .eq('id', contentItemId);
-
-    // Get the account
-    const account = contentItem.connected_accounts;
-    if (!account || account.status !== 'active') {
-      throw new Error('Account is not active for publishing');
-    }
-
-    await job.updateProgress(30);
-
-    // Decrypt access token (in production, use KMS)
-    const accessToken = account.encrypted_access_token; // TODO: decrypt
-
-    // Publish to platform
-    let publishResult;
-    if (account.platform === 'instagram') {
-      publishResult = await publishToInstagram(contentItem, account, accessToken);
-    } else if (account.platform === 'facebook') {
-      publishResult = await publishToFacebook(contentItem, account, accessToken);
-    } else {
-      throw new Error(`Unsupported platform: ${account.platform}`);
-    }
-
-    await job.updateProgress(80);
-
-    // Update content item with publication details
-    await supabase
-      .from('content_items')
-      .update({
-        status: 'published',
-        published_at: new Date().toISOString(),
-        meta_post_id: publishResult.postId,
-        insights_snapshot: publishResult.metadata,
-      })
-      .eq('id', contentItemId);
-
-    await job.updateProgress(100);
-
-    // Log audit event
-    await logAuditEvent(contentItemId, 'content.published', {
-      platform: account.platform,
-      postId: publishResult.postId,
-    });
-
-    console.log(`[Publishing] Published to ${account.platform}: ${publishResult.postId}`);
-
-    return {
-      success: true,
-      contentItemId,
-      platform: account.platform,
-      postId: publishResult.postId,
-    };
-  } catch (error) {
-    console.error(`[Publishing] Error for content ${contentItemId}:`, error);
-
-    await supabase
-      .from('content_items')
-      .update({
-        status: 'failed',
-        validation_errors: [error instanceof Error ? error.message : String(error)],
-      })
-      .eq('id', contentItemId);
-
-    throw error;
-  }
-}
-
-/**
- * Publish to Instagram via Graph API
- */
-async function publishToInstagram(
-  contentItem: any,
-  account: any,
-  accessToken: string
-): Promise<{ postId: string; metadata: any }> {
-  const publisher = createInstagramPublisher(
-    process.env.META_APP_ID || '',
-    process.env.META_APP_SECRET || '',
-    accessToken
-  );
-
-  // Get the media URL
-  const mediaUrl = contentItem.rendering_manifest?.finalMediaUrl;
-  if (!mediaUrl) {
-    throw new Error('No media URL found');
+    const outputs = item.media_type === 'video_reel' ? [render.data.output] : (render.data.slides || [render.data.output]);
+    mediaUrls = outputs.map((output) => signMediaPath(storagePathFromUrl(output.url), MEDIA_URL_TTL_SECONDS));
+  } catch (signError) {
+    return { success: false, blocked: true, code: 'PUBLIC_MEDIA_NOT_CONFIGURED', reason: (signError as Error).message };
   }
 
-  // Get public URL (signed URL for local Minio)
-  const { data: signedUrlData } = await storage
-    .from('viralforge-content')
-    .createSignedUrl(mediaUrl, 3600);
+  await supabase.from('content_items').update({ status: 'publishing' }).eq('id', contentItemId);
+  const caption = composeCaption(item);
+  const results: Publication[] = [];
+  await job.updateProgress(10);
 
-  if (!signedUrlData?.signedUrl) {
-    throw new Error('Failed to create signed URL for media');
+  for (const account of accounts as Account[]) {
+    results.push(await publishToAccount(item, account, mediaUrls, caption, runId, stageAttemptId));
+    await job.updateProgress(10 + Math.round((results.length / accounts.length) * 85));
   }
 
-  // Prepare caption
-  const caption = `${contentItem.hook_variation_a}\n\n${contentItem.script_body || ''}\n\n#${contentItem.niche_id} #reels #trending`;
+  const published = results.filter((result) => result.status === 'published');
+  const uncertain = results.filter((result) => result.status === 'uncertain');
+  const failed = results.filter((result) => result.status === 'failed');
 
-  // Publish Reel
-  const result = await publisher.publishReel({
-    accountId: account.account_id,
-    videoUrl: signedUrlData.signedUrl,
-    caption,
-    aiDisclosureRequired: contentItem.ai_disclosure_required,
-  });
-
-  return {
-    postId: result.mediaId,
-    metadata: {
-      ...result.metadata,
-      publishedAt: new Date().toISOString(),
-    },
-  };
-}
-
-/**
- * Publish to Facebook via Graph API
- */
-async function publishToFacebook(
-  contentItem: any,
-  account: any,
-  accessToken: string
-): Promise<{ postId: string; metadata: any }> {
-  const publisher = createFacebookPublisher(
-    process.env.META_APP_ID || '',
-    process.env.META_APP_SECRET || '',
-    accessToken
-  );
-
-  // Get the media URL
-  const mediaUrl = contentItem.rendering_manifest?.finalMediaUrl;
-  if (!mediaUrl) {
-    throw new Error('No media URL found');
-  }
-
-  const { data: signedUrlData } = await storage
-    .from('viralforge-content')
-    .createSignedUrl(mediaUrl, 3600);
-
-  if (!signedUrlData?.signedUrl) {
-    throw new Error('Failed to create signed URL for media');
-  }
-
-  // Publish to Facebook Page as Reel
-  const result = await publisher.publishReel({
-    pageId: account.account_id,
-    videoUrl: signedUrlData.signedUrl,
-    title: contentItem.hook_variation_a,
-    description: contentItem.script_body || '',
-  });
-
-  return {
-    postId: result.postId,
-    metadata: {
-      ...result.metadata,
-      publishedAt: new Date().toISOString(),
-    },
-  };
-}
-
-async function logAuditEvent(
-  contentItemId: string,
-  action: string,
-  metadata: Record<string, any>
-) {
   await supabase.from('audit_logs').insert({
+    organization_id: item.organization_id,
     content_item_id: contentItemId,
-    action,
+    niche_id: item.niche_id,
+    action: failed.length || uncertain.length ? 'publishing.partial' : 'publishing.completed',
     actor: 'system',
     actor_type: 'system',
-    metadata,
+    metadata: { results: results.map(({ error: message, ...rest }) => ({ ...rest, error: message?.slice(0, 300) })) },
   });
+
+  if (failed.length === 0 && uncertain.length === 0) {
+    await supabase.from('content_items').update({
+      status: 'published',
+      published_at: new Date().toISOString(),
+      meta_post_id: published[0]?.remoteId || null,
+      insights_snapshot: { publications: results },
+    }).eq('id', contentItemId);
+    return { success: true, contentItemId, publications: results };
+  }
+
+  await supabase.from('content_items').update({ insights_snapshot: { publications: results } }).eq('id', contentItemId);
+  if (uncertain.length > 0 || failed.every((result) => result.classification === 'blocked')) {
+    // Needs a human: token reconnect, or checking whether an uncertain post went live.
+    return {
+      success: false,
+      blocked: true,
+      code: uncertain.length ? 'PUBLISH_UNCERTAIN' : 'ACCOUNT_BLOCKED',
+      reason: [...uncertain, ...failed].map((result) => `${result.platform}: ${result.error}`).join(' | ').slice(0, 1000),
+    };
+  }
+  // Retry-all re-runs this stage; accounts already published are skipped.
+  throw new MediaProviderError(
+    `Publishing failed for ${failed.map((result) => result.platform).join(', ')}: ${failed.map((result) => result.error).join(' | ')}`.slice(0, 1000),
+    failed.some((result) => result.classification === 'retryable') ? 'retryable' : 'permanent',
+    { providerCode: 'PUBLISH_FAILED' },
+  );
+}
+
+async function publishToAccount(
+  item: any,
+  account: Account,
+  mediaUrls: string[],
+  caption: string,
+  runId: string,
+  stageAttemptId: string,
+): Promise<Publication> {
+  const base = { accountId: account.id, platform: account.platform };
+  const { data: attempt, error } = await supabase
+    .from('publication_attempts')
+    .upsert({
+      pipeline_run_id: runId,
+      stage_attempt_id: stageAttemptId,
+      organization_id: item.organization_id,
+      content_item_id: item.id,
+      connected_account_id: account.id,
+      platform: account.platform,
+      content_revision: item.version || 1,
+      schedule_revision: item.schedule_revision || 1,
+    }, { onConflict: 'content_item_id,connected_account_id,content_revision,schedule_revision', ignoreDuplicates: true })
+    .select('*')
+    .maybeSingle();
+  if (error) throw new Error(`Failed to record publication attempt: ${error.message}`);
+  const current = attempt || (await supabase
+    .from('publication_attempts')
+    .select('*')
+    .eq('content_item_id', item.id)
+    .eq('connected_account_id', account.id)
+    .eq('content_revision', item.version || 1)
+    .eq('schedule_revision', item.schedule_revision || 1)
+    .single()).data;
+  if (!current) throw new Error('Publication attempt row is missing');
+
+  if (current.status === 'published') return { ...base, status: 'published', remoteId: current.remote_post_id, permalink: current.permalink };
+  if (current.status === 'uncertain') return { ...base, status: 'uncertain', error: 'Previous attempt may have published; verify on the platform, then mark resolved' };
+
+  await supabase.from('publication_attempts').update({
+    status: 'processing',
+    stage_attempt_id: stageAttemptId,
+    started_at: new Date().toISOString(),
+    error: null,
+  }).eq('id', current.id);
+
+  const saveContainer = async (containerId: string) => {
+    await supabase.from('publication_attempts').update({ remote_container_id: containerId }).eq('id', current.id);
+  };
+
+  let finalCallStarted = false;
+  try {
+    const client = new MetaGraphClient({ accessToken: decryptSecret(account.encrypted_access_token), graphVersion: process.env.META_GRAPH_VERSION });
+    const mediaType = item.media_type as MediaType;
+    let outcome: PublishOutcome;
+    if (account.platform === 'instagram') {
+      if (current.remote_container_id) {
+        finalCallStarted = true;
+        outcome = await client.resumeInstagramContainer(account.account_id, current.remote_container_id);
+      } else {
+        const onContainer = async (id: string) => { await saveContainer(id); finalCallStarted = true; };
+        outcome = mediaType === 'video_reel'
+          ? await client.publishInstagramReel(account.account_id, mediaUrls[0], caption, onContainer)
+          : mediaType === 'image_carousel'
+            ? await client.publishInstagramCarousel(account.account_id, mediaUrls, caption, onContainer)
+            : await client.publishInstagramImage(account.account_id, mediaUrls[0], caption, onContainer);
+      }
+    } else {
+      finalCallStarted = true;
+      outcome = mediaType === 'video_reel'
+        ? await client.publishFacebookReel(account.account_id, mediaUrls[0], caption, saveContainer)
+        : mediaType === 'image_carousel'
+          ? await client.publishFacebookMultiPhoto(account.account_id, mediaUrls, caption)
+          : await client.publishFacebookPhoto(account.account_id, mediaUrls[0], caption);
+    }
+
+    await supabase.from('publication_attempts').update({
+      status: 'published',
+      remote_post_id: outcome.remoteId,
+      remote_container_id: outcome.containerId || current.remote_container_id,
+      permalink: outcome.permalink || null,
+      completed_at: new Date().toISOString(),
+    }).eq('id', current.id);
+    return { ...base, status: 'published', remoteId: outcome.remoteId, permalink: outcome.permalink };
+  } catch (publishError) {
+    const message = publishError instanceof Error ? publishError.message : String(publishError);
+    const classification = publishError instanceof TokenCryptoError
+      ? 'blocked'
+      : (publishError as MediaProviderError).classification || 'retryable';
+    // IG retries resume the saved container (publishable once), so only a
+    // Facebook network failure after the final call started is ambiguous.
+    const ambiguous = account.platform === 'facebook' && finalCallStarted
+      && (publishError as MediaProviderError).providerCode === 'META_NETWORK';
+    const status = ambiguous ? 'uncertain' : 'failed';
+    await supabase.from('publication_attempts').update({
+      status,
+      error: { message: message.slice(0, 1000), classification },
+      completed_at: new Date().toISOString(),
+      // A failed IG container cannot be reused; clear it so the retry creates a new one.
+      ...(status === 'failed' && classification === 'permanent' ? { remote_container_id: null } : {}),
+    }).eq('id', current.id);
+    if (classification === 'blocked') {
+      await supabase.from('connected_accounts').update({ status: 'expired' }).eq('id', account.id);
+    }
+    return { ...base, status, error: message, classification };
+  }
+}
+
+function stripRenderExtras(manifest: Record<string, unknown> | null): Record<string, unknown> {
+  const { finalMediaUrl: _f, duration: _d, codec: _c, resolution: _r, slideCount: _s, ...rest } = manifest || {};
+  return rest;
 }

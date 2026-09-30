@@ -29,7 +29,8 @@
     "infra:down": "docker compose down && npm run supabase:stop",
     "docker:up": "docker compose --profile app up -d",
     "docker:down": "docker compose down",
-    "docker:logs": "docker compose logs -f"
+    "docker:logs": "docker compose logs -f",
+    "test:db": "node scripts/pgtap.mjs"
   },
   "devDependencies": {
     "concurrently": "^8.2.2",

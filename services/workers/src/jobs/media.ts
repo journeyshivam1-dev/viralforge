@@ -1,256 +1,181 @@
 /**
  * Media Worker
- * Generates per-scene images via Replicate, checkpoints artifacts, and builds a MediaManifest.
- * Replaces the legacy Omniroute-based media generation.
+ * Generates per-scene images (all media types) and per-scene Hindi voiceover
+ * (reels) through the AI provider chain: Omniroute, then Gemini, then Replicate
+ * when configured. Every artifact is checkpointed into
+ * ai_generation_metadata.sceneArtifacts as soon as it is stored, so a retry only
+ * generates what is still missing.
  */
 
 import { Job } from 'bullmq';
-import { createClient } from '@supabase/supabase-js';
 import { requireSupabaseAdmin } from '@viralforge/supabase';
 import {
   GeneratedContentPackageSchema,
-  SceneArtifactSchema,
   MediaManifestSchema,
-  type GeneratedContentPackage,
-  type SceneArtifact,
+  SceneArtifactSchema,
+  createAiProviderChainFromEnv,
+  type BinaryOutput,
   type MediaManifest,
+  type MediaType,
+  type SceneArtifact,
   type ScenePlan,
 } from '@viralforge/domain';
-import { createReplicateAdapter, MediaProviderError, MediaProviderErrorClassification } from '@viralforge/domain';
 
 const supabase = requireSupabaseAdmin();
 const storage = supabase.storage;
+const aiChain = createAiProviderChainFromEnv();
+const BUCKET = 'viralforge-content';
 
-// Initialize Replicate adapter from environment
-let replicateAdapter: ReturnType<typeof createReplicateAdapter> | null = null;
-
-function getReplicateAdapter() {
-  if (replicateAdapter) return replicateAdapter;
-
-  const apiToken = process.env.REPLICATE_API_TOKEN?.trim();
-  const imageModelVersion = process.env.REPLICATE_IMAGE_MODEL_VERSION?.trim();
-  const videoModelVersion = process.env.REPLICATE_VIDEO_MODEL_VERSION?.trim() || undefined;
-  const timeoutMs = parseInt(process.env.REPLICATE_TIMEOUT_MS || '120000', 10);
-
-  if (!apiToken || !imageModelVersion) {
-    throw new MediaProviderError(
-      'Replicate is not configured: set REPLICATE_API_TOKEN and REPLICATE_IMAGE_MODEL_VERSION',
-      'blocked' as MediaProviderErrorClassification,
-    );
-  }
-
-  replicateAdapter = createReplicateAdapter({
-    apiToken,
-    image: { version: imageModelVersion },
-    video: videoModelVersion ? { version: videoModelVersion } : undefined,
-    timeoutMs,
-  });
-  return replicateAdapter;
-}
-
-const MAX_CONCURRENT_SCENES = Number(process.env.MEDIA_MAX_CONCURRENT_SCENES || 2);
-const DOWNLOAD_TIMEOUT_MS = 30_000;
-const MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024; // 50 MB
+const MAX_CONCURRENT_SCENES = Math.max(1, Number(process.env.MEDIA_MAX_CONCURRENT_SCENES || 2));
+const MAX_ARTIFACT_BYTES = Number(process.env.MEDIA_DOWNLOAD_MAX_BYTES || 50 * 1024 * 1024);
+const TTS_LANGUAGE = process.env.TTS_LANGUAGE || 'hi-IN';
 const ALLOWED_IMAGE_MIME = new Set(['image/jpeg', 'image/png', 'image/webp']);
-const ALLOWED_VIDEO_MIME = new Set(['video/mp4', 'video/webm', 'video/quicktime']);
+const ALLOWED_AUDIO_MIME = new Set(['audio/mpeg', 'audio/mp3', 'audio/wav', 'audio/x-wav', 'audio/ogg', 'audio/aac', 'audio/mp4']);
+const SIGNED_URL_SECONDS = 60 * 60 * 24 * 30;
 
-async function downloadWithLimits(url: string): Promise<{ buffer: Buffer; mimeType: string }> {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
-  try {
-    const response = await fetch(url, { signal: controller.signal });
-    clearTimeout(timeoutId);
-    if (!response.ok) throw new Error(`Download failed: ${response.status} ${response.statusText}`);
-    const contentType = response.headers.get('content-type') || '';
-    const mimeType = contentType.split(';')[0].trim();
-    const chunks: Uint8Array[] = [];
-    let total = 0;
-    if (response.body) {
-      const reader = response.body.getReader();
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        total += value.length;
-        if (total > MAX_DOWNLOAD_BYTES) throw new Error('Download exceeds size limit');
-        chunks.push(value);
-      }
-    }
-    const buffer = Buffer.concat(chunks);
-    return { buffer, mimeType };
-  } finally {
-    clearTimeout(timeoutId);
-  }
-}
+type ArtifactKind = 'image' | 'audio';
 
-function getStoragePath(contentItemId: string, sceneIndex: number, kind: 'image' | 'video', attemptNo: number): string {
-  const ext = kind === 'video' ? 'mp4' : 'jpg';
-  return `media/${contentItemId}/scene-${sceneIndex}-attempt-${attemptNo}.${ext}`;
-}
-
-async function uploadArtifact(
-  contentItemId: string,
-  sceneIndex: number,
-  kind: 'image' | 'video',
-  attemptNo: number,
-  buffer: Buffer,
-  mimeType: string,
-): Promise<string> {
-  const path = getStoragePath(contentItemId, sceneIndex, kind, attemptNo);
-  const { error } = await storage.from('viralforge-content').upload(path, buffer, {
-    contentType: mimeType,
-    upsert: false,
-  });
-  if (error) throw new Error(`Upload failed: ${error.message}`);
-  return path;
-}
-
-function validateSceneArtifact(artifact: unknown): SceneArtifact {
-  const result = SceneArtifactSchema.safeParse(artifact);
-  if (!result.success) {
-    throw new Error(`Invalid SceneArtifact: ${result.error.flatten().formErrors.join(', ')}`);
-  }
-  return result.data;
-}
-
-function validateMediaManifest(manifest: unknown): MediaManifest {
-  const result = MediaManifestSchema.safeParse(manifest);
-  if (!result.success) {
-    throw new Error(`Invalid MediaManifest: ${result.error.flatten().formErrors.join(', ')}`);
-  }
-  return result.data;
-}
-
-async function getContentItem(contentItemId: string) {
-  const { data, error } = await supabase
-    .from('content_items')
-    .select('*, ai_generation_metadata')
-    .eq('id', contentItemId)
-    .single();
-  if (error || !data) throw new Error(`Content item not found: ${contentItemId}`);
-  return data;
-}
-
-async function updateContentItemAiMetadata(contentItemId: string, metadata: Record<string, unknown>) {
-  const { error } = await supabase
-    .from('content_items')
-    .update({ ai_generation_metadata: metadata })
-    .eq('id', contentItemId);
-  if (error) throw new Error(`Failed to update content item: ${error.message}`);
-}
+const EXTENSIONS: Record<string, string> = {
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/webp': 'webp',
+  'audio/mpeg': 'mp3',
+  'audio/mp3': 'mp3',
+  'audio/wav': 'wav',
+  'audio/x-wav': 'wav',
+  'audio/ogg': 'ogg',
+  'audio/aac': 'aac',
+  'audio/mp4': 'm4a',
+};
 
 export async function mediaWorker(job: Job) {
   const { contentItemId } = job.data as { contentItemId: string };
-  const workerId = `${process.env.HOSTNAME || 'worker'}-media-${job.id}`;
 
-  console.log(`[Media] Starting per-scene media generation for ${contentItemId}`);
+  const { data: item, error } = await supabase
+    .from('content_items')
+    .select('id, organization_id, niche_id, media_type, ai_generation_metadata')
+    .eq('id', contentItemId)
+    .single();
+  if (error || !item) throw Object.assign(new Error(`Content item not found: ${contentItemId}`), { code: 'NOT_FOUND' });
 
-  try {
-    await job.updateProgress(5);
-
-    // Fetch content item and validate generated content
-    const contentItem = await getContentItem(contentItemId);
-    const genMeta = contentItem.ai_generation_metadata || {};
-
-    const genResult = GeneratedContentPackageSchema.safeParse(genMeta.generatedContent || genMeta);
-    if (!genResult.success) {
-      throw new Error(`Generated content missing or invalid: ${genResult.error.flatten().formErrors.join(', ')}`);
-    }
-    const generatedContent: GeneratedContentPackage = genResult.data;
-
-    const existingArtifacts: SceneArtifact[] = Array.isArray(genMeta.sceneArtifacts)
-      ? genMeta.sceneArtifacts.filter((a: unknown) => SceneArtifactSchema.safeParse(a).success)
-      : [];
-
-    const scenes: ScenePlan[] = generatedContent.scenes;
-    if (scenes.length === 0) throw new Error('No scenes found in generated content');
-
-    // Initialize adapter (throws blocked if not configured)
-    const adapter = getReplicateAdapter();
-
-    // Generate missing scene artifacts
-    const allArtifacts: SceneArtifact[] = [...existingArtifacts];
-    const generatedSceneIndices = new Set(existingArtifacts.map((a) => a.sceneIndex));
-
-    for (let i = 0; i < scenes.length; i += MAX_CONCURRENT_SCENES) {
-      const batch = scenes.slice(i, i + MAX_CONCURRENT_SCENES);
-      await Promise.all(
-        batch.map(async (scene) => {
-          if (generatedSceneIndices.has(scene.index)) return;
-
-          const attemptNo = 1; // For simplicity; could track per-scene retries later
-
-          const result = await adapter.generate({
-            sceneIndex: scene.index,
-            kind: 'image', // image-only first; video fallback gated by config
-            prompt: scene.visualPrompt,
-            negativePrompt: scene.negativePrompt,
-            width: 1080,
-            height: 1920,
-          });
-
-          // Take first returned artifact for this scene
-          const artifact = result[0];
-          if (!artifact) throw new Error(`No artifact returned for scene ${scene.index}`);
-
-          const validatedArtifact = validateSceneArtifact(artifact);
-
-          // Download and upload
-          const { buffer, mimeType } = await downloadWithLimits(validatedArtifact.url);
-          if (!ALLOWED_IMAGE_MIME.has(mimeType)) throw new Error(`Unsupported MIME type: ${mimeType}`);
-
-          const storagePath = await uploadArtifact(contentItemId, scene.index, 'image', attemptNo, buffer, mimeType);
-
-          // Construct a signed URL for the artifact record (uses service-role, so accessible)
-          const { data: signed } = await storage.from('viralforge-content').createSignedUrl(storagePath, 60 * 60 * 24 * 365);
-          const artifactUrl = signed?.signedUrl || storagePath;
-
-          const finalArtifact: SceneArtifact = {
-            ...validatedArtifact,
-            url: artifactUrl,
-            mimeType,
-            width: 1080,
-            height: 1920,
-            metadata: {
-              ...validatedArtifact.metadata,
-              storagePath,
-              downloadSizeBytes: buffer.length,
-            },
-          };
-
-          allArtifacts.push(finalArtifact);
-          generatedSceneIndices.add(scene.index);
-
-          // Persist partial progress
-          const updatedMeta = { ...genMeta, sceneArtifacts: allArtifacts };
-          await updateContentItemAiMetadata(contentItemId, updatedMeta);
-        }),
-      );
-
-      await job.updateProgress(20 + Math.round((i + batch.length) / scenes.length * 70));
-    }
-
-    // Build MediaManifest
-    const mediaManifest: MediaManifest = validateMediaManifest({
-      schemaVersion: 1,
-      contentItemId,
-      artifacts: allArtifacts.sort((a, b) => a.sceneIndex - b.sceneIndex),
-      createdAt: new Date().toISOString(),
-    });
-
-    // Persist final manifest
-    const finalMeta = { ...genMeta, sceneArtifacts: allArtifacts, mediaManifest };
-    await updateContentItemAiMetadata(contentItemId, finalMeta);
-
-    await job.updateProgress(100);
-    console.log(`[Media] Completed ${allArtifacts.length} scene artifacts for ${contentItemId}`);
-
-    return { success: true, contentItemId, artifactCount: allArtifacts.length };
-  } catch (error) {
-    console.error(`[Media] Error for ${contentItemId}:`, error);
-    if (error instanceof MediaProviderError) {
-      // Attach classification for runtime to handle correctly
-      throw error;
-    }
-    throw error;
+  const metadata = (item.ai_generation_metadata || {}) as Record<string, any>;
+  const parsed = GeneratedContentPackageSchema.safeParse(metadata.generatedContent);
+  if (!parsed.success) {
+    // Generation output is missing: the operator must retry generation, not media.
+    return { success: false, blocked: true, code: 'GENERATED_CONTENT_MISSING', reason: 'Generated content package is missing or invalid; retry from generation' };
   }
+  const generated = parsed.data;
+  const mediaType = (item.media_type || 'video_reel') as MediaType;
+  const aspectRatio = mediaType === 'video_reel' ? '9:16' : '4:5';
+
+  const artifacts = new Map<string, SceneArtifact>();
+  for (const candidate of Array.isArray(metadata.sceneArtifacts) ? metadata.sceneArtifacts : []) {
+    const valid = SceneArtifactSchema.safeParse(candidate);
+    if (valid.success && valid.data.metadata?.storagePath) artifacts.set(key(valid.data.sceneIndex, valid.data.kind as ArtifactKind), valid.data);
+  }
+
+  const work: Array<{ scene: ScenePlan; kind: ArtifactKind }> = [];
+  for (const scene of generated.scenes) {
+    if (!artifacts.has(key(scene.index, 'image'))) work.push({ scene, kind: 'image' });
+    if (mediaType === 'video_reel' && scene.voiceover && !artifacts.has(key(scene.index, 'audio'))) work.push({ scene, kind: 'audio' });
+  }
+
+  let completed = 0;
+  const freshUsage: Array<Record<string, unknown>> = [];
+  // Serialize checkpoint writes so concurrent scenes never overwrite each other.
+  let checkpoint = Promise.resolve();
+  const persist = () => {
+    checkpoint = checkpoint.then(() => saveMetadata(contentItemId, { ...metadata, sceneArtifacts: sorted(artifacts) }));
+    return checkpoint;
+  };
+
+  for (let index = 0; index < work.length; index += MAX_CONCURRENT_SCENES) {
+    const batch = work.slice(index, index + MAX_CONCURRENT_SCENES);
+    const results = await Promise.allSettled(batch.map(async ({ scene, kind }) => {
+      const output = kind === 'image'
+        ? await aiChain.generateImage({
+            prompt: [generated.visualStyle, scene.visualPrompt, 'No text, letters, watermarks or logos.'].filter(Boolean).join(' '),
+            negativePrompt: scene.negativePrompt,
+            aspectRatio,
+          })
+        : await aiChain.generateSpeech({ text: scene.voiceover, language: TTS_LANGUAGE });
+      const artifact = await storeArtifact(contentItemId, scene.index, kind, output);
+      artifacts.set(key(scene.index, kind), artifact);
+      freshUsage.push({ stage: 'media', kind, sceneIndex: scene.index, provider: output.provider, model: output.model });
+      await persist();
+    }));
+    completed += batch.length;
+    await job.updateProgress(10 + Math.round((completed / Math.max(1, work.length)) * 80));
+    const failure = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+    // Successful siblings are already checkpointed; the retry resumes from here.
+    if (failure) throw failure.reason;
+  }
+  await checkpoint;
+
+  const mediaManifest: MediaManifest = MediaManifestSchema.parse({
+    schemaVersion: 1,
+    contentItemId,
+    artifacts: sorted(artifacts),
+    createdAt: new Date().toISOString(),
+  });
+  await saveMetadata(contentItemId, {
+    ...metadata,
+    sceneArtifacts: mediaManifest.artifacts,
+    mediaManifest,
+    usage: [...(metadata.usage || []), ...freshUsage],
+  });
+
+  await job.updateProgress(100);
+  return {
+    success: true,
+    contentItemId,
+    images: mediaManifest.artifacts.filter((artifact) => artifact.kind === 'image').length,
+    audioClips: mediaManifest.artifacts.filter((artifact) => artifact.kind === 'audio').length,
+    generated: work.length,
+  };
+}
+
+async function storeArtifact(contentItemId: string, sceneIndex: number, kind: ArtifactKind, output: BinaryOutput & { fallbackAttempts?: unknown[] }): Promise<SceneArtifact> {
+  const allowed = kind === 'image' ? ALLOWED_IMAGE_MIME : ALLOWED_AUDIO_MIME;
+  if (!allowed.has(output.mimeType)) {
+    throw Object.assign(new Error(`${output.provider} returned unsupported ${kind} type ${output.mimeType}`), { code: 'UNSUPPORTED_MEDIA' });
+  }
+  if (output.buffer.length === 0 || output.buffer.length > MAX_ARTIFACT_BYTES) {
+    throw Object.assign(new Error(`${kind} for scene ${sceneIndex} has invalid size ${output.buffer.length}`), { code: 'INVALID_MEDIA_SIZE' });
+  }
+
+  const storagePath = `media/${contentItemId}/scene-${sceneIndex}-${kind}.${EXTENSIONS[output.mimeType] || 'bin'}`;
+  // upsert keeps retries idempotent when a previous attempt uploaded but did not checkpoint.
+  const { error } = await storage.from(BUCKET).upload(storagePath, output.buffer, { contentType: output.mimeType, upsert: true });
+  if (error) throw new Error(`Upload failed for scene ${sceneIndex} ${kind}: ${error.message}`);
+  const { data: signed, error: signError } = await storage.from(BUCKET).createSignedUrl(storagePath, SIGNED_URL_SECONDS);
+  if (signError || !signed?.signedUrl) throw new Error(`Could not sign scene ${sceneIndex} ${kind}: ${signError?.message}`);
+
+  return SceneArtifactSchema.parse({
+    sceneIndex,
+    kind,
+    url: signed.signedUrl,
+    provider: output.provider,
+    mimeType: output.mimeType,
+    metadata: {
+      storagePath,
+      model: output.model,
+      sizeBytes: output.buffer.length,
+      fallbackAttempts: output.fallbackAttempts || [],
+      generatedAt: new Date().toISOString(),
+    },
+  });
+}
+
+async function saveMetadata(contentItemId: string, metadata: Record<string, unknown>) {
+  const { error } = await supabase.from('content_items').update({ ai_generation_metadata: metadata }).eq('id', contentItemId);
+  if (error) throw new Error(`Failed to checkpoint media: ${error.message}`);
+}
+
+function key(sceneIndex: number, kind: ArtifactKind): string {
+  return `${sceneIndex}:${kind}`;
+}
+
+function sorted(artifacts: Map<string, SceneArtifact>): SceneArtifact[] {
+  return [...artifacts.values()].sort((a, b) => a.sceneIndex - b.sceneIndex || a.kind.localeCompare(b.kind));
 }

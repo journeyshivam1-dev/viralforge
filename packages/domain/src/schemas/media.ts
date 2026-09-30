@@ -52,18 +52,26 @@ export const MediaManifestSchema = z.object({
 
 export type MediaManifest = z.infer<typeof MediaManifestSchema>;
 
+const RenderedOutputSchema = z.object({
+  url: MediaLocationSchema,
+  mimeType: NonEmptyTextSchema,
+  width: z.number().int().positive(),
+  height: z.number().int().positive(),
+  // Required for video; absent for still images.
+  durationSeconds: z.number().positive().optional(),
+  sizeBytes: z.number().int().nonnegative().optional(),
+}).strict();
+
+export type RenderedOutput = z.infer<typeof RenderedOutputSchema>;
+
 export const RenderManifestSchema = z.object({
   schemaVersion: z.literal(1),
   contentItemId: NonEmptyTextSchema,
   mediaManifest: MediaManifestSchema,
-  output: z.object({
-    url: MediaLocationSchema,
-    mimeType: NonEmptyTextSchema,
-    width: z.number().int().positive(),
-    height: z.number().int().positive(),
-    durationSeconds: z.number().positive(),
-    sizeBytes: z.number().int().nonnegative().optional(),
-  }).strict(),
+  /** Primary output: the reel video, or the first slide of an image post. */
+  output: RenderedOutputSchema,
+  /** Every slide of an image post, in publishing order. */
+  slides: z.array(RenderedOutputSchema).optional(),
   renderedAt: z.string().datetime({ offset: true }),
   renderer: NonEmptyTextSchema,
 }).strict();
